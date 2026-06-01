@@ -62,6 +62,11 @@ class MerlinHeatQPINN(nn.Module):
         u = out[:, 0:1]
         ux_hat = out[:, 1:2]
 
+
+        # Enforce homogeneous Dirichlet boundary conditions: u(0,t)=u(1,t)=0
+        #u = x * (1.0 - x) * u
+
+
         return u, ux_hat
 
 
@@ -107,6 +112,9 @@ class ClassicalHeatQPINN(nn.Module):
 
         u = out[:, 0:1]
         ux_hat = out[:, 1:2]
+
+        # Enforce homogeneous Dirichlet boundary conditions: u(0,t)=u(1,t)=0
+        #u = x * (1.0 - x) * u
 
         return u, ux_hat
 

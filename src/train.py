@@ -20,9 +20,9 @@ def train(
     pde: PDE,
     loss_fn = total_loss,
     # ---------- sampling ----------
-    n_interior: int = 64,
-    n_initial: int = 64,
-    n_boundary: int = 64,
+    n_interior: int = 64,       #64,
+    n_initial: int = 64,        #64,
+    n_boundary: int = 64,       #64,
     # ---------- optimisation ----------
     epochs: int = 300,
     lr: float = 1e-2,
