@@ -20,9 +20,7 @@ def train(
     pde: PDE,
     loss_fn = total_loss,
     # ---------- sampling ----------
-    n_interior: int = 64,
-    n_initial: int = 64,
-    n_boundary: int = 64,
+    sampler = None,
     # ---------- optimisation ----------
     epochs: int = 300,
     lr: float = 1e-2,
@@ -51,7 +49,7 @@ def train(
         loss_fn:          loss object with .total_loss(model, xt_f, xt_i, xt_b,
                               exact_fn, lambda_f, lambda_c, lambda_i, lambda_b)
                           returning (total_loss, loss_dict)
-        n_interior/initial/boundary: collocation point counts
+        sampler :         sampler instance used to sample points fed to loss function
         epochs:           number of training epochs
         lr:               learning rate
         optimizer_name:   "adam", "sgd", or "lbfgs"
@@ -67,6 +65,7 @@ def train(
     Returns:
         history: np.ndarray of shape (epochs, 6)
                  columns: [total, pde, consistency, initial, boundary]
+                 :param sampler:
     """
     # ------------------------------------------------------------------ setup
     if device is None:
@@ -86,14 +85,8 @@ def train(
     print(f"Parameters — total: {total_params:,}  trainable: {trainable_params:,}")
 
     # ------------------------------------------------------------------ sampler
-    sampler = DataSampler(
-        pde=pde,
-        n_interior=n_interior,
-        n_initial=n_initial,
-        n_boundary=n_boundary,
-        device=device,
-        dtype=dtype,
-    )
+    if sampler is None:
+        sampler = DataSampler(pde=pde, device=device, dtype=dtype)
 
     # ------------------------------------------------------------------ optimizer
     opt_name = optimizer_name.lower()
