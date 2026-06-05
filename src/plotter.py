@@ -112,6 +112,56 @@ def plot_solution_comparison(
     return fig, rel_l2
 
 
+def seed_l2_comparison(l2_array_1, l2_array_2, name_1 = "Model 1", name_2 = "Model 2", save_path = None, show = True):
+    """"
+    Given L2 errors of two models with same settings but varying seed
+    Plot errors comparison of two models for each seed as well as mean error
+
+    Args:
+        l2_array_1:     L2 error of model 1 for each seed
+        l2_array_2:     L2 error of model 2 for each seed
+        name_1,2:       names of models
+        save_path:      optional save path for figure
+        show:           set to False to not show figure
+    """
+    # x-coordinates (indices)
+    x = np.arange(len(l2_array_1))
+
+    # Plot points
+    plt.scatter(x, l2_array_1, color='blue', label=name_1)
+    plt.scatter(x, l2_array_2, color='red', label=name_2)
+
+    # means
+    mean1 = np.mean(l2_array_1)
+    mean2 = np.mean(l2_array_2)
+
+    # Connect corresponding points
+    for i in range(len(l2_array_1)):
+        plt.plot(
+            [x[i], x[i]],
+            [l2_array_1[i], l2_array_2[i]],
+            linestyle='--',
+            color='gray',
+            linewidth=1
+        )
+
+    # Mean lines
+    plt.axhline(mean1, color='blue', linewidth=2,
+                label=name_1 + f' mean = {mean1:.2f}', alpha=0.35)
+    plt.axhline(mean2, color='red', linewidth=2,
+                label=name_2 + f' mean = {mean2:.2f}', alpha=0.35)
+
+    plt.xlabel('Seed index')
+    plt.ylabel('L2 Error')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    if save_path is not None:
+        _save(plt.gcf(), save_path)
+
+    if show : plt.show()
+
 # ── Fourier analysis plots ─────────────────────────────────────────────────────
 def plot_power_spectrum(
     U_pred: Union[torch.Tensor, np.ndarray],
