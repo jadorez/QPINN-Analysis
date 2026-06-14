@@ -4,13 +4,18 @@ from typing import Tuple
 from merlin.core.state_vector import StateVector
 from src.utils import generate_fock_basis
 
+import perceval as pcvl
+import scipy
+
+import merlin as ML
+
 
 class MerlinHeatQPINN(nn.Module):
     """
     QPINN model using MerLin quantum layer for pde resolution.
     """
 
-    def __init__(self, feature_size : int = 4, quantum_output_size : int = 4, hidden_feature : int = 16, hidden_readout : int = 16):
+    def __init__(self, feature_size : int = 4, quantum_output_size : int = 20, hidden_feature : int = 16, hidden_readout : int = 4):
         super().__init__()
         self.feature_size = feature_size
         self.quantum_output_size = quantum_output_size
@@ -71,7 +76,7 @@ class ClassicalHeatQPINN(nn.Module):
     Useful for comparing quantum vs classical performance.
     """
 
-    def __init__(self, feature_size : int = 4, quantum_output_size : int = 4, hidden_feature : int = 16, hidden_readout : int = 16):
+    def __init__(self, feature_size : int = 4, quantum_output_size : int = 20, hidden_feature : int = 16, hidden_readout : int = 4):
         super().__init__()
         self.feature_size = feature_size
         self.quantum_output_size = quantum_output_size
@@ -108,6 +113,104 @@ class ClassicalHeatQPINN(nn.Module):
         u = out[:, 0:1]
         ux_hat = out[:, 1:2]
 
+        return u, ux_hat
+
+class MerlinTunableSimple(nn.Module):
+    """
+    QPINN model using MerLin quantum layer for heat equation.
+    Enforces homogeneous Dirichlet BCs through hard constraint: u = x(1-x)*q_u
+    """
+    
+    def __init__(self, feature_size : int = 4, hidden_feature : int = 16, hidden_readout : int = 4, trainable_outer : bool = True):
+        super().__init__()
+        self.feature_size = feature_size
+        self.hidden_feature = hidden_feature
+        self.hidden_readout = hidden_readout
+        self.trainable_outer = trainable_outer
+        
+        # Classical feature map: (x, t) -> 2 features
+        self.feature_map = nn.Sequential(
+            nn.Linear(2, self.hidden_feature),
+            nn.Tanh(),
+            nn.Linear(self.hidden_feature, self.feature_size), 
+        )
+        
+        input_size = self.feature_size
+
+        n_modes = input_size + 1
+        if n_modes > 20:
+            raise ValueError(
+                "Input size too large for the simple layer construction. For large inputs (with larger size than 19), please use the CircuitBuilder. Here is a quick tutorial on how to use it: https://merlinquantum.ai/quickstart/first_quantum_layer.html#circuitbuilder-walkthrough"
+            )
+        if input_size < 1:
+            raise ValueError(f"input_size must be at least 1, got {input_size}")
+
+        input_state = n_modes * [0]
+        for i in range(n_modes):
+            if i % 2 == 0:
+                input_state[i] = 1
+
+
+        n_photons = sum(input_state)
+        input_state = pcvl.BasicState(input_state)
+
+
+        builder = ML.CircuitBuilder(n_modes=n_modes)
+        # Trainable entangling layer before encoding
+        builder.add_entangling_layer(trainable=True, name="LI_simple", trainable_outer=self.trainable_outer)
+
+        # Angle encoding
+        builder.add_angle_encoding(
+            modes=list(range(input_size)),
+            name="input",
+            subset_combinations=False,
+        )
+
+        # Trainable entangling layer after encoding
+        builder.add_entangling_layer(trainable=True, name="RI_simple", trainable_outer=self.trainable_outer)
+
+        self.quantum = ML.QuantumLayer(
+                input_size=self.feature_size,
+                builder=builder,
+                input_state=StateVector.from_basic_state(input_state),
+                measurement_strategy=ML.MeasurementStrategy.amplitudes(computation_space='fock')
+            )
+
+        self.readout = nn.Sequential(
+            nn.Linear(int(scipy.special.comb(n_modes+n_photons-1, n_photons)), self.hidden_readout),
+            nn.Tanh(),
+            nn.Linear(self.hidden_readout, 2),
+        )
+    
+    def forward(self, xt: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass.
+        
+        Args:
+            xt: tensor of shape (batch, 2) with columns [x, t]
+        
+        Returns:
+            u: solution field, shape (batch, 1)
+            ux_hat: x-derivative approximation, shape (batch, 1)
+        """
+        x = xt[:, 0:1]
+        z = self.feature_map(xt)
+        q_amplitudes = self.quantum(z)
+        # 3. Derive probabilities for classical readout: P(x) = |c|^2 -> (batch, 20) real
+        q_probs = torch.abs(q_amplitudes) ** 2
+
+        # 4. Classical Readout Pipeline
+        out = self.readout(q_probs)
+        
+        q_u = out[:, 0:1]
+        ux_hat = out[:, 1:2]
+        
+#        if self.config.use_hard_bc:
+#            # Enforce homogeneous Dirichlet boundary conditions: u(0,t)=u(1,t)=0
+#            u = x * (1.0 - x) * q_u
+#        else:
+        u = q_u
+        
         return u, ux_hat
 
 
@@ -252,9 +355,9 @@ class BuilderMerlinHeatQPINN(nn.Module):
         q_u = out[:, 0:1]
         ux_hat = out[:, 1:2]
 
-        if self.config.use_hard_bc:
-            u = x * (1.0 - x) * q_u
-        else:
-            u = q_u
+#        if self.config.use_hard_bc:
+#            u = x * (1.0 - x) * q_u
+#        else:
+        u = q_u
 
         return u, ux_hat, entropy.mean()

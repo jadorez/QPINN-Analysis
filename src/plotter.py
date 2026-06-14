@@ -4,7 +4,6 @@ plotter.py — plotting utilities for QPINN / classical PINN results.
 Functions:
     plot_training_history(history, ...)
     plot_solution_comparison(U_pred, U_true, x_grid, t_grid, ...)
-
     --- Fourier analysis ---
     plot_power_spectrum(U_pred, U_true, ...)
     plot_mode_l2_errors(U_pred, U_true, ...)
@@ -358,6 +357,7 @@ def plot_frequency_sweep(
     sweep_results: Dict[str, List[Dict]],
     save_path: Optional[Union[str, Path]] = None,
     show: bool = True,
+    label: str = 'Frequency',
 ) -> plt.Figure:
     """
     Final relative-L2 error vs PDE frequency for each model type.
@@ -378,11 +378,14 @@ def plot_frequency_sweep(
         rows_sorted = sorted(rows, key=lambda r: r["frequency"])
         freqs  = [r["frequency"] for r in rows_sorted]
         errors = [r["rel_l2"]    for r in rows_sorted]
-        ax.semilogy(freqs, errors, marker="o", lw=2, label=model_label)
+        errors_mean = [np.mean(r) for r in errors]
+        errors_std = [np.std(r) for r in errors]
+        #ax.semilogy(freqs, errors, marker="o", lw=2, label=model_label)
+        ax.errorbar(freqs, errors_mean, yerr=errors_std / np.sqrt(len(errors[0])), marker="o", lw=2, label=model_label, capsize=3)
 
-    ax.set_xlabel("PDE initial-condition frequency", fontsize=12)
+    ax.set_xlabel("PDE {label}", fontsize=12)
     ax.set_ylabel("Final relative L2 error", fontsize=12)
-    ax.set_title("Frequency sweep: final error vs frequency", fontsize=13)
+    ax.set_title(f"{label} sweep: final error vs {label}", fontsize=13)
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
     fig.tight_layout()

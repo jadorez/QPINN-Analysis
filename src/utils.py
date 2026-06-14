@@ -1,6 +1,7 @@
 from typing import Tuple, List
 import torch
-
+import scipy
+import numpy as np
 
 def generate_fock_basis(photons: int, modes: int) -> List[Tuple[int, ...]]:
     # Helper function to generate the Fock basis in descending lexicographic order
@@ -33,6 +34,31 @@ def gradient(y: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         create_graph=True,
         retain_graph=True,
     )[0]
+
+def hilbert_space_dimension(feature_size: int):
+    #Compute Hilbert space dimension
+    
+    n_modes = feature_size+1
+    
+    n_photons = np.ceil(n_modes/2)
+    dimH = int(scipy.special.comb(n_modes+n_photons-1, n_photons))
+    return dimH
+
+def quantum_outputsize_for_param_match(feature_size: int, hidden_readout: int):
+    #Compute Hilbert space dimension
+    n_modes = feature_size+1
+
+#    input_state = n_modes * [0]
+#    for i in range(n_modes):                            #Non-opti, should be packed into a formula like n_photons = 1+(n_modes // 2)
+#        if i % 2 == 0:
+#            input_state[i] = 1
+#    n_photons = sum(input_state)
+
+    n_photons = np.ceil(n_modes/2)
+    dimH = hilbert_space_dimension(feature_size)
+    return (2 * feature_size * (feature_size+1) + dimH * hidden_readout) / (feature_size + hidden_readout + 1)
+    #return (feature_size * (dimH+1) + dimH * (hidden_readout+1)) / (feature_size + hidden_readout + 1)
+
 
 
 
