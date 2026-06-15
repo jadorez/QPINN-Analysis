@@ -117,8 +117,7 @@ class ClassicalHeatQPINN(nn.Module):
 
 class MerlinTunableSimple(nn.Module):
     """
-    QPINN model using MerLin quantum layer for heat equation.
-    Enforces homogeneous Dirichlet BCs through hard constraint: u = x(1-x)*q_u
+    Similar to MerlinHeatQpinn but has architecture that allows same # weights as classical model
     """
     
     def __init__(self, feature_size : int = 4, hidden_feature : int = 16, hidden_readout : int = 4, trainable_outer : bool = True):
