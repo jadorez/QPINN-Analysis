@@ -12,8 +12,8 @@ class PDE:
     t_min: float = 0.0
     t_max: float = 1.0
 
-    def residual(self, u = None, u_x = None, u_t = None, u_xx = None, u_tt = None):
-        """Takes model output including derivatives and returns PDE residual."""
+    def residual(self, u, u_x, points):
+        """Takes model output and sample points and returns PDE residual."""
         return 0
 
     def exact_solution(self, x, t):
@@ -50,8 +50,13 @@ class HeatEquation(PDE):
     t_max: float = 1.0
 
 
-    def residual(self, u=None, u_x=None, u_t=None, u_xx=None, u_tt=None):
-        """Uses u and du/dx computes and returns residual du/dt - alpha * d²u/dx²"""
+    def residual(self, u, u_x, points):
+        """Uses u and du/dx and sample points computes and returns residual du/dt - alpha * d²u/dx²"""
+
+        u_xx = gradient(u_x, points)[:, 0:1]
+
+        u_t = gradient(u, points)[:, 1:2]
+
         return u_t - self.alpha * u_xx
 
 

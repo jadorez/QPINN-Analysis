@@ -70,15 +70,11 @@ def pde_loss(model, xt_int, pde: PDE):
         MSE Loss of residual of the PDE for the model output
     """
 
-    # TODO : for now this doesnt compute u_tt to save compute, should be extended to get form pde what terms are needed and feed it those
 
-    u, u_x, *_ = model(xt_int)
+    u, u_x, *_ = model(xt_int) # model output
 
-
-    u_t = gradient(u, xt_int)[:, 1:2]
-    u_xx = gradient(u_x, xt_int)[:, 0:1]
-
-    r = pde.residual(u=u, u_x=u_x, u_t=u_t, u_xx=u_xx)
+    # use the PDE method to compute the residual from the derivatives
+    r = pde.residual(u, u_x, xt_int)
 
     return mse(r, torch.zeros_like(r))
 
