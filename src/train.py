@@ -8,7 +8,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
-from typing import Optional
+from typing import Callable, Optional
 
 from src.sampler import DataSampler
 from src.pde import PDE
@@ -39,6 +39,8 @@ def train(
     dtype: torch.dtype = torch.float32,
     log_every: int = 50,
     seed: int = 42,
+    eval_every: Optional[int] = None,
+    eval_callback: Optional[Callable[[nn.Module, int], None]] = None,
 ) -> np.ndarray:
     """
     Train a PINN model.
@@ -61,9 +63,14 @@ def train(
         dtype:            torch dtype
         log_every:        print interval
         seed:             random seed
+        eval_every:       if set (together with eval_callback), call eval_callback
+                          every `eval_every` epochs (and at epoch 1)
+        eval_callback:    optional fn(model, epoch) invoked for side effects (e.g.
+                          recording accuracy/entropy trajectories); does not affect
+                          the returned history
 
     Returns:
-        history: np.ndarray of shape (epochs, 6)
+        history: np.ndarray of shape (epochs, 5)
                  columns: [total, pde, consistency, initial, boundary]
                  :param sampler:
     """
@@ -142,6 +149,9 @@ def train(
 
         if scheduler is not None:
             scheduler.step()
+
+        if eval_every is not None and eval_callback is not None and (epoch == 1 or epoch % eval_every == 0):
+            eval_callback(model, epoch)
 
         history.append([
             loss_dict["total"],

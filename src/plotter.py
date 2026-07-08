@@ -111,6 +111,127 @@ def plot_solution_comparison(
     return fig, rel_l2
 
 
+def plot_entropy_accuracy_trajectory(
+    epochs: Union[np.ndarray, list],
+    entropy_mean: Union[np.ndarray, list],
+    entropy_std: Union[np.ndarray, list],
+    rel_l2_mean: Union[np.ndarray, list],
+    rel_l2_std: Union[np.ndarray, list],
+    errorevery: Optional[int] = None,
+    save_path: Optional[Union[str, Path]] = None,
+    show: bool = True,
+) -> plt.Figure:
+    """
+    Two-panel trajectory plot: entanglement entropy and rel L2 accuracy vs. epoch,
+    each averaged over seeds with std shown as error bars.
+
+    Args:
+        epochs:       epoch indices, shape (n_points,)
+        entropy_mean: mean entropy across seeds, shape (n_points,)
+        entropy_std:  std of entropy across seeds, shape (n_points,)
+        rel_l2_mean:  mean rel L2 error across seeds, shape (n_points,)
+        rel_l2_std:   std of rel L2 error across seeds, shape (n_points,)
+        errorevery:   spacing between drawn error bars (avoids overplotting).
+                      Defaults to ~15 bars spread across the trajectory, so
+                      short runs (e.g. smoke tests) don't end up with a single
+                      bar at epoch 1 and nothing else.
+        save_path:    full file path to save to (None = skip)
+        show:         call plt.show()
+    Returns:
+        fig
+    """
+    if errorevery is None:
+        errorevery = max(1, len(epochs) // 15)
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+
+    ax1.errorbar(epochs, entropy_mean, yerr=entropy_std, errorevery=errorevery,
+                 color='tab:purple', linewidth=2, ecolor='tab:purple', alpha=0.85,
+                 capsize=3, label='Entanglement entropy')
+    ax1.set_ylabel("Von Neumann entropy", fontsize=12)
+    ax1.set_title("Entanglement entropy vs. training epoch", fontsize=14)
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(fontsize=10)
+
+    ax2.errorbar(epochs, rel_l2_mean, yerr=rel_l2_std, errorevery=errorevery,
+                 color='tab:green', linewidth=2, ecolor='tab:green', alpha=0.85,
+                 capsize=3, label='Relative L2 error')
+    ax2.set_yscale("log")
+    ax2.set_xlabel("Epoch", fontsize=12)
+    ax2.set_ylabel("Relative L2 error", fontsize=12)
+    ax2.set_title("Model accuracy vs. training epoch", fontsize=14)
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(fontsize=10)
+
+    fig.tight_layout()
+    _save(fig, save_path)
+    if show:
+        plt.show()
+    return fig
+
+
+def plot_model_comparison_trajectory(
+    epochs: Union[np.ndarray, list],
+    rel_l2_by_model: Dict[str, Tuple[np.ndarray, np.ndarray]],
+    entropy_by_model: Optional[Dict[str, Tuple[np.ndarray, np.ndarray]]] = None,
+    errorevery: Optional[int] = None,
+    save_path: Optional[Union[str, Path]] = None,
+    show: bool = True,
+) -> plt.Figure:
+    """
+    Overlays rel L2 (and optionally entanglement entropy) trajectories for
+    several models on shared axes, each averaged over seeds with std as error
+    bars. Use this to compare e.g. quantum models with different
+    n_encoding_layers against a parameter-matched classical baseline.
+
+    Args:
+        epochs:           epoch indices, shape (n_points,)
+        rel_l2_by_model:  {model_label: (mean, std)} arrays, each (n_points,)
+        entropy_by_model: optional {model_label: (mean, std)}; entropy panel is
+                           omitted entirely if None (e.g. an all-classical run)
+        errorevery:       spacing between drawn error bars. Defaults to ~15
+                           bars spread across the trajectory.
+        save_path:        full file path to save to (None = skip)
+        show:             call plt.show()
+    Returns:
+        fig
+    """
+    if errorevery is None:
+        errorevery = max(1, len(epochs) // 15)
+
+    n_panels = 2 if entropy_by_model else 1
+    fig, axes = plt.subplots(n_panels, 1, figsize=(10, 4 * n_panels), sharex=True, squeeze=False)
+    axes = axes[:, 0]
+
+    if entropy_by_model:
+        ax_ent, ax_l2 = axes
+        for label, (mean, std) in entropy_by_model.items():
+            ax_ent.errorbar(epochs, mean, yerr=std, errorevery=errorevery, label=label,
+                             linewidth=2, alpha=0.85, capsize=3)
+        ax_ent.set_ylabel("Von Neumann entropy", fontsize=12)
+        ax_ent.set_title("Entanglement entropy vs. training epoch", fontsize=14)
+        ax_ent.grid(True, alpha=0.3)
+        ax_ent.legend(fontsize=10)
+    else:
+        (ax_l2,) = axes
+
+    for label, (mean, std) in rel_l2_by_model.items():
+        ax_l2.errorbar(epochs, mean, yerr=std, errorevery=errorevery, label=label,
+                        linewidth=2, alpha=0.85, capsize=3)
+    ax_l2.set_yscale("log")
+    ax_l2.set_xlabel("Epoch", fontsize=12)
+    ax_l2.set_ylabel("Relative L2 error", fontsize=12)
+    ax_l2.set_title("Model accuracy vs. training epoch", fontsize=14)
+    ax_l2.grid(True, alpha=0.3)
+    ax_l2.legend(fontsize=10)
+
+    fig.tight_layout()
+    _save(fig, save_path)
+    if show:
+        plt.show()
+    return fig
+
+
 def seed_l2_comparison(l2_array_1, l2_array_2, name_1 = "Model 1", name_2 = "Model 2", save_path = None, show = True):
     """"
     Given L2 errors of two models with same settings but varying seed
