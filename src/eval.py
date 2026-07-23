@@ -19,6 +19,8 @@ import torch
 import torch.nn as nn
 from typing import Optional, Tuple, Dict
 
+from src.utils import fisher_information
+
 
 def evaluate(
     model: nn.Module,
@@ -28,25 +30,46 @@ def evaluate(
     device: Optional[torch.device] = None,
     dtype: torch.dtype = torch.float32,
     verbose: bool = True,
+    compute_qfi: bool = False,
 ) -> Tuple[Dict, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Evaluate a trained PINN on a regular (x, t) grid.
 
     Args:
-        model:   trained PyTorch model; forward(xt) -> (u, *extras)
-        pde:     PDE object exposing:
-                   .x_min, .x_max  — spatial domain
-                   .t_min, .t_max  — temporal domain
-                   .exact_solution(x, t) -> tensor
-        nx:      number of spatial grid points
-        nt:      number of temporal grid points
-        device:  torch device (defaults to cuda if available else cpu)
-        dtype:   torch dtype
-        verbose: print progress/metrics (set False for per-epoch calls during training)
+        model:       trained PyTorch model; forward(xt) -> (u, *extras)
+        pde:         PDE object exposing:
+                       .x_min, .x_max  — spatial domain
+                       .t_min, .t_max  — temporal domain
+                       .exact_solution(x, t) -> tensor
+        nx:          number of spatial grid points
+        nt:          number of temporal grid points
+        device:      torch device (defaults to cuda if available else cpu)
+        dtype:       torch dtype
+        verbose:     print progress/metrics (set False for per-epoch calls during training)
+        compute_qfi: also compute the Quantum and Classical Fisher Information
+                     Matrices w.r.t. (x, t) — requires `model.amplitudes(xt)`
+                     (see MerlinTunableSimple.amplitudes). Costs ~2*hilbert_dim
+                     backward passes total for both (see utils.fisher_information),
+                     so leave False for per-epoch calls during training and
+                     only enable for a final, modest-resolution grid.
 
     Returns:
-        metrics:  dict with keys rel_l2, mae, max_abs_error, rmse, entropy
-                  (entropy is None if the model's forward() doesn't return one)
+        metrics:  dict with keys rel_l2, mae, max_abs_error, rmse, entropy,
+                  entropy_grid, qfi_grid, cfi_grid.
+                  entropy is the scalar mean entropy over the grid (None if
+                  the model's forward() doesn't return one).
+                  entropy_grid is the per-point entropy reshaped to (nx, nt)
+                  (None if the model only returns a scalar entropy, e.g.
+                  already-reduced via .mean() inside forward()) — use it to
+                  plot entanglement entropy as a function of (x, t).
+                  qfi_grid/cfi_grid are the per-point Quantum/Classical Fisher
+                  Information matrices reshaped to (nx, nt, 2, 2) (None unless
+                  compute_qfi=True and the model has an `amplitudes` method).
+                  qfi_grid is the resolving power of the encoded state under
+                  an ideal measurement; cfi_grid (<= qfi_grid pointwise, in
+                  the Loewner sense) is what the model's actual Fock-basis
+                  probability readout realizes — compare them to see how much
+                  of the state's theoretical sensitivity the readout captures.
         U_pred:   predicted solution tensor of shape (nx, nt)  [on cpu]
         U_true:   exact solution tensor of shape (nx, nt)      [on cpu]
         x_grid:   spatial coordinates of shape (nx, 1)         [on cpu]
@@ -68,11 +91,30 @@ def evaluate(
     with torch.no_grad():
         out = model(xt_grid)
         U_pred = out[0].reshape(nx, nt).cpu()
-        entropy = float(out[2]) if len(out) > 2 else None
+
+        entropy = None
+        entropy_grid = None
+        if len(out) > 2:
+            entropy_raw = out[2]
+            entropy = float(entropy_raw.mean())
+            if entropy_raw.numel() == nx * nt:
+                entropy_grid = entropy_raw.reshape(nx, nt).cpu()
 
         U_true = pde.exact_solution(
             xt_grid[:, 0:1], xt_grid[:, 1:2]
         ).reshape(nx, nt).cpu()
+
+    qfi_grid = None
+    cfi_grid = None
+    amplitude_fn = getattr(model, "amplitudes", None)
+    if compute_qfi and callable(amplitude_fn):
+        # fisher_information needs gradient tracking through xt_grid, which
+        # the no_grad block above deliberately disables for everything else —
+        # compute it in its own scope regardless of caller context.
+        with torch.enable_grad():
+            qfim, cfim = fisher_information(amplitude_fn, xt_grid)  # type: ignore[arg-type]
+        qfi_grid = qfim.reshape(nx, nt, 2, 2).cpu()
+        cfi_grid = cfim.reshape(nx, nt, 2, 2).cpu()
 
     error = U_pred - U_true
     rel_l2 = float(torch.linalg.norm(error) / torch.linalg.norm(U_true))
@@ -86,6 +128,9 @@ def evaluate(
         "max_abs_error": max_abs_error,
         "rmse": rmse,
         "entropy": entropy,
+        "entropy_grid": entropy_grid,
+        "qfi_grid": qfi_grid,
+        "cfi_grid": cfi_grid,
     }
 
     if verbose:
@@ -95,5 +140,12 @@ def evaluate(
         print(f"  RMSE        : {rmse:.4e}")
         if entropy is not None:
             print(f"  Entropy     : {entropy:.4e}")
+        if qfi_grid is not None and cfi_grid is not None:
+            qfi_trace = float((qfi_grid[..., 0, 0] + qfi_grid[..., 1, 1]).mean())
+            cfi_trace = float((cfi_grid[..., 0, 0] + cfi_grid[..., 1, 1]).mean())
+            efficiency = cfi_trace / qfi_trace if qfi_trace > 0 else float("nan")
+            print(f"  QFI trace (mean) : {qfi_trace:.4e}")
+            print(f"  CFI trace (mean) : {cfi_trace:.4e}")
+            print(f"  Extraction efficiency Tr(CFI)/Tr(QFI) : {efficiency:.4f}")
 
     return metrics, U_pred, U_true, x.cpu(), t.cpu()

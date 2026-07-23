@@ -227,6 +227,16 @@ class MerlinTunableSimple(nn.Module):
         self.quantum.to(*args, **kwargs)
         return self
 
+    def amplitudes(self, xt: torch.Tensor) -> torch.Tensor:
+        """
+        Fock-basis amplitudes before the |.|^2 readout, shape (batch, hilbert_dim)
+        complex. Exposed separately from forward() for computing quantities that
+        need the raw state as a differentiable function of xt, e.g. the Quantum
+        Fisher Information (see utils.quantum_fisher_information / eval.py's
+        `compute_qfi`).
+        """
+        return self.quantum(self.feature_map(xt))
+
     def forward(self, xt: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Forward pass.
@@ -237,11 +247,13 @@ class MerlinTunableSimple(nn.Module):
         Returns:
             u: solution field, shape (batch, 1)
             ux_hat: x-derivative approximation, shape (batch, 1)
-            entropy: mean Von Neumann entanglement entropy across the batch, scalar
+            entropy: per-sample Von Neumann entanglement entropy, shape (batch,).
+                Reduce with .mean() for a scalar summary, or reshape against the
+                (x, t) grid it was evaluated on to plot entropy as a function of
+                (x, t) — see eval.py's `entropy_grid`.
         """
         x = xt[:, 0:1]
-        z = self.feature_map(xt)
-        q_amplitudes = self.quantum(z)
+        q_amplitudes = self.amplitudes(xt)
         # 3. Derive probabilities for classical readout: P(x) = |c|^2 -> (batch, 20) real
         q_probs = torch.abs(q_amplitudes) ** 2
 
@@ -259,7 +271,7 @@ class MerlinTunableSimple(nn.Module):
 #        else:
         u = q_u
 
-        return u, ux_hat, entropy.mean()
+        return u, ux_hat, entropy
 
 
 def _hilbert_dim(feature_size: int) -> int:

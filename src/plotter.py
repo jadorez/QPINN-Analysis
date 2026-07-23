@@ -111,6 +111,298 @@ def plot_solution_comparison(
     return fig, rel_l2
 
 
+def plot_entropy_field(
+    entropy_grid: Union[torch.Tensor, np.ndarray],
+    x_grid: Optional[Union[torch.Tensor, np.ndarray]] = None,
+    t_grid: Optional[Union[torch.Tensor, np.ndarray]] = None,
+    save_path: Optional[Union[str, Path]] = None,
+    show: bool = True,
+) -> plt.Figure:
+    """
+    Single-panel heatmap of Von Neumann entanglement entropy as a function of
+    (x, t), e.g. at the end of training. Get `entropy_grid` from
+    `eval.evaluate()`'s `metrics["entropy_grid"]` (only populated for models
+    whose forward() returns a per-sample entropy tensor rather than an
+    already-reduced scalar).
+
+    Args:
+        entropy_grid: (nx, nt) array of per-point entropy
+        x_grid:       spatial coordinates, shape (nx, 1) or (nx,)
+        t_grid:       temporal coordinates, shape (nt, 1) or (nt,)
+        save_path:    full file path to save to (None = skip)
+        show:         call plt.show()
+    Returns:
+        fig
+    """
+    entropy_np = _to_numpy(entropy_grid)
+
+    if x_grid is not None and t_grid is not None:
+        xv, tv = _to_numpy(x_grid).squeeze(), _to_numpy(t_grid).squeeze()
+        extent = (float(tv[0]), float(tv[-1]), float(xv[0]), float(xv[-1]))
+    else:
+        extent = (0.0, 1.0, 0.0, 1.0)
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    im = ax.imshow(entropy_np, origin="lower", extent=extent, aspect="auto", cmap="viridis")
+    ax.set_xlabel("t", fontsize=11)
+    ax.set_ylabel("x", fontsize=11)
+    ax.set_title("Entanglement entropy — S(x, t)", fontsize=12)
+    fig.colorbar(im, ax=ax, label="Von Neumann entropy")
+    fig.tight_layout()
+    _save(fig, save_path)
+    if show:
+        plt.show()
+    return fig
+
+
+def plot_qfi_field(
+    qfi_grid: Union[torch.Tensor, np.ndarray],
+    x_grid: Optional[Union[torch.Tensor, np.ndarray]] = None,
+    t_grid: Optional[Union[torch.Tensor, np.ndarray]] = None,
+    save_path: Optional[Union[str, Path]] = None,
+    show: bool = True,
+) -> plt.Figure:
+    """
+    Four-panel heatmap of the Quantum Fisher Information Matrix (QFIM) as a
+    function of (x, t): F_xx, F_tt, F_xt (off-diagonal), and Tr(F) = F_xx+F_tt.
+    Get `qfi_grid` from `eval.evaluate(..., compute_qfi=True)`'s
+    `metrics["qfi_grid"]`. Higher values mean the quantum-encoded state is
+    more sensitive to — i.e. more easily distinguishes — small shifts in that
+    input near that point.
+
+    Args:
+        qfi_grid: (nx, nt, 2, 2) array, [[F_xx, F_xt], [F_xt, F_tt]] per point
+        x_grid:   spatial coordinates, shape (nx, 1) or (nx,)
+        t_grid:   temporal coordinates, shape (nt, 1) or (nt,)
+        save_path: full file path to save to (None = skip)
+        show:      call plt.show()
+    Returns:
+        fig
+    """
+    qfi_np = _to_numpy(qfi_grid)
+
+    if x_grid is not None and t_grid is not None:
+        xv, tv = _to_numpy(x_grid).squeeze(), _to_numpy(t_grid).squeeze()
+        extent = (float(tv[0]), float(tv[-1]), float(xv[0]), float(xv[-1]))
+    else:
+        extent = (0.0, 1.0, 0.0, 1.0)
+
+    panels = [
+        (qfi_np[..., 0, 0], "F_xx"),
+        (qfi_np[..., 1, 1], "F_tt"),
+        (qfi_np[..., 0, 1], "F_xt"),
+        (qfi_np[..., 0, 0] + qfi_np[..., 1, 1], "Tr(F) = F_xx + F_tt"),
+    ]
+
+    fig, axes = plt.subplots(2, 2, figsize=(11, 9))
+    for ax, (data, title) in zip(axes.flat, panels):
+        im = ax.imshow(data, origin="lower", extent=extent, aspect="auto", cmap="magma")
+        ax.set_xlabel("t", fontsize=11)
+        ax.set_ylabel("x", fontsize=11)
+        ax.set_title(title, fontsize=12)
+        fig.colorbar(im, ax=ax)
+    fig.suptitle("Quantum Fisher Information vs. (x, t)", fontsize=14)
+    fig.tight_layout()
+    _save(fig, save_path)
+    if show:
+        plt.show()
+    return fig
+
+
+def plot_fisher_efficiency_field(
+    qfi_grid: Union[torch.Tensor, np.ndarray],
+    cfi_grid: Union[torch.Tensor, np.ndarray],
+    x_grid: Optional[Union[torch.Tensor, np.ndarray]] = None,
+    t_grid: Optional[Union[torch.Tensor, np.ndarray]] = None,
+    save_path: Optional[Union[str, Path]] = None,
+    show: bool = True,
+) -> plt.Figure:
+    """
+    Three-panel comparison of Tr(QFI) — the encoded state's theoretical
+    resolving power under an ideal measurement — against Tr(CFI) — what the
+    model's actual Fock-basis probability readout realizes — and their ratio
+    Tr(CFI)/Tr(QFI), the fraction of theoretical sensitivity the readout
+    actually captures at each (x, t). Get qfi_grid/cfi_grid from
+    `eval.evaluate(..., compute_qfi=True)`'s `metrics["qfi_grid"]` /
+    `metrics["cfi_grid"]`.
+
+    A low efficiency somewhere means the quantum encoding carries sensitivity
+    to (x, t) there that the readout can't access — headroom for a better
+    measurement/readout design, not evidence the encoding itself is weak.
+
+    Args:
+        qfi_grid, cfi_grid: (nx, nt, 2, 2) arrays, same layout as plot_qfi_field
+        x_grid, t_grid, save_path, show: see plot_qfi_field
+    Returns:
+        fig
+    """
+    qfi_trace = _to_numpy(qfi_grid)[..., 0, 0] + _to_numpy(qfi_grid)[..., 1, 1]
+    cfi_trace = _to_numpy(cfi_grid)[..., 0, 0] + _to_numpy(cfi_grid)[..., 1, 1]
+    efficiency = cfi_trace / np.clip(qfi_trace, 1e-12, None)
+
+    if x_grid is not None and t_grid is not None:
+        xv, tv = _to_numpy(x_grid).squeeze(), _to_numpy(t_grid).squeeze()
+        extent = (float(tv[0]), float(tv[-1]), float(xv[0]), float(xv[-1]))
+    else:
+        extent = (0.0, 1.0, 0.0, 1.0)
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
+    panels = [
+        (qfi_trace, "Tr(QFI) — theoretical resolving power", "magma", None),
+        (cfi_trace, "Tr(CFI) — realized by actual readout", "magma", None),
+        (efficiency, "Tr(CFI) / Tr(QFI) — extraction efficiency", "viridis", (0.0, 1.0)),
+    ]
+    for ax, (data, title, cmap, clim) in zip(axes, panels):
+        im = ax.imshow(data, origin="lower", extent=extent, aspect="auto", cmap=cmap,
+                        vmin=clim[0] if clim else None, vmax=clim[1] if clim else None)
+        ax.set_xlabel("t", fontsize=11)
+        ax.set_ylabel("x", fontsize=11)
+        ax.set_title(title, fontsize=11)
+        fig.colorbar(im, ax=ax)
+    fig.tight_layout()
+    _save(fig, save_path)
+    if show:
+        plt.show()
+    return fig
+
+
+def plot_ntk_spectrum(
+    eigvals_by_model: Dict[str, Union[torch.Tensor, np.ndarray]],
+    param_counts: Optional[Dict[str, int]] = None,
+    save_path: Optional[Union[str, Path]] = None,
+    show: bool = True,
+) -> plt.Figure:
+    """
+    Log-scale empirical-NTK eigenvalue decay for one or more models, overlaid.
+    Get eigvals from `ntk.empirical_ntk(model, xt)`.
+
+    Faster decay = the kernel's "effective dimension" is smaller, i.e. fewer
+    directions carry most of the representational capacity — the spectral-bias
+    counterpart to a model's raw parameter count. If `param_counts` is given, a
+    vertical dashed line marks each model's parameter count (P), since a
+    finite-width empirical NTK Gram on N>P points has rank <= P, so eigenvalues
+    should fall off sharply near index P.
+
+    Args:
+        eigvals_by_model: {model_label: eigvals}, each (N,) descending
+        param_counts:      optional {model_label: P} to mark rank cutoffs
+        save_path:         full file path to save to (None = skip)
+        show:               call plt.show()
+    Returns:
+        fig
+    """
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for label, eigvals in eigvals_by_model.items():
+        ev = _to_numpy(eigvals)
+        ev_clipped = np.clip(ev, 1e-12, None)
+        ax.semilogy(np.arange(1, len(ev) + 1), ev_clipped, lw=2, alpha=0.85, label=label)
+        if param_counts and label in param_counts:
+            ax.axvline(param_counts[label], linestyle="--", alpha=0.5,
+                        color=ax.lines[-1].get_color())
+    ax.set_xlabel("Eigenvalue index", fontsize=12)
+    ax.set_ylabel("Eigenvalue (log scale)", fontsize=12)
+    ax.set_title("Empirical NTK spectrum", fontsize=13)
+    ax.grid(True, alpha=0.3, which="both")
+    ax.legend(fontsize=10)
+    fig.tight_layout()
+    _save(fig, save_path)
+    if show:
+        plt.show()
+    return fig
+
+
+def plot_spectral_alignment(
+    C_by_model: Dict[str, Union[torch.Tensor, np.ndarray]],
+    save_path: Optional[Union[str, Path]] = None,
+    show: bool = True,
+) -> plt.Figure:
+    """
+    Cumulative target-power curves C(k) for one or more models, overlaid —
+    the fraction of the target function's power captured by each model's
+    top-k NTK eigendirections. Get C from `ntk.spectral_power_curve(...)`.
+
+    C(k) rising faster (saturating near 1 at smaller k) means the target is
+    more concentrated in that model's dominant, fast-learning-under-linearized
+    -training directions — i.e. better task-model spectral alignment. All
+    curves reach exactly 1.0 at k=N (trivial, eigvecs are a complete basis);
+    the informative comparison is the shape/rise, not the endpoint.
+
+    Args:
+        C_by_model: {model_label: C}, each (N,) non-decreasing, C[-1]==1
+        save_path:  full file path to save to (None = skip)
+        show:       call plt.show()
+    Returns:
+        fig
+    """
+    fig, ax = plt.subplots(figsize=(7, 5))
+    for label, C in C_by_model.items():
+        c = _to_numpy(C)
+        ax.plot(np.arange(1, len(c) + 1), c, lw=2, alpha=0.85, label=label)
+    ax.set_xlabel("k (top-k NTK eigendirections)", fontsize=12)
+    ax.set_ylabel("C(k) — cumulative target power captured", fontsize=12)
+    ax.set_title("Task-model spectral alignment", fontsize=13)
+    ax.set_ylim(0, 1.02)
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=10)
+    fig.tight_layout()
+    _save(fig, save_path)
+    if show:
+        plt.show()
+    return fig
+
+
+def plot_low_eigenvalue_error_field(
+    actual_error_grid: Union[torch.Tensor, np.ndarray],
+    low_eig_error_grid: Union[torch.Tensor, np.ndarray],
+    x_grid: Optional[Union[torch.Tensor, np.ndarray]] = None,
+    t_grid: Optional[Union[torch.Tensor, np.ndarray]] = None,
+    save_path: Optional[Union[str, Path]] = None,
+    show: bool = True,
+) -> plt.Figure:
+    """
+    Two-panel comparison: a trained model's actual pointwise error |u_pred -
+    u_true|, vs. that same error field projected onto the bottom (slowest-
+    learning) fraction of the model's at-initialization NTK eigendirections
+    (`ntk.project_low_eigenvalue_subspace`). Visual/quantitative agreement
+    between the two panels is evidence that persistent error is explained by
+    NTK spectral bias rather than e.g. insufficient training or collocation
+    density.
+
+    Args:
+        actual_error_grid, low_eig_error_grid: (nx, nt) arrays
+        x_grid, t_grid: spatial/temporal coordinates, shape (nx,1)/(nt,1) or (nx,)/(nt,)
+        save_path:      full file path to save to (None = skip)
+        show:            call plt.show()
+    Returns:
+        fig
+    """
+    actual_np = _to_numpy(actual_error_grid)
+    low_np = _to_numpy(low_eig_error_grid)
+
+    if x_grid is not None and t_grid is not None:
+        xv, tv = _to_numpy(x_grid).squeeze(), _to_numpy(t_grid).squeeze()
+        extent = (float(tv[0]), float(tv[-1]), float(xv[0]), float(xv[-1]))
+    else:
+        extent = (0.0, 1.0, 0.0, 1.0)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+    panels = [
+        (actual_np, "Actual |u_pred - u_true|"),
+        (low_np, "Error projected onto low-eigenvalue NTK subspace"),
+    ]
+    for ax, (data, title) in zip(axes, panels):
+        im = ax.imshow(data, origin="lower", extent=extent, aspect="auto", cmap="inferno")
+        ax.set_xlabel("t", fontsize=11)
+        ax.set_ylabel("x", fontsize=11)
+        ax.set_title(title, fontsize=11)
+        fig.colorbar(im, ax=ax)
+    fig.tight_layout()
+    _save(fig, save_path)
+    if show:
+        plt.show()
+    return fig
+
+
 def plot_entropy_accuracy_trajectory(
     epochs: Union[np.ndarray, list],
     entropy_mean: Union[np.ndarray, list],
@@ -509,6 +801,194 @@ def plot_frequency_sweep(
     ax.set_title(f"{label} sweep: final error vs {label}", fontsize=13)
     ax.legend(fontsize=10)
     ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    _save(fig, save_path)
+    if show:
+        plt.show()
+    return fig
+
+
+# ── spectral diagnostics (src/spectral.py) ──────────────────────────────────
+
+def plot_omega_eff_trajectory(
+    epochs: Union[np.ndarray, list],
+    omega_eff_by_feature: Dict[int, Union[np.ndarray, list]],
+    save_path: Optional[Union[str, Path]] = None,
+    show: bool = True,
+) -> plt.Figure:
+    """
+    omega_eff (spectral second moment, see spectral.spectral_second_moment)
+    vs. training epoch, one line per encoded feature. omega_eff in [0, 1]
+    measures how much high-frequency content the quantum layer supplies for
+    that feature at that point in training; nan values (layer constant in
+    that feature) are simply not plotted for that epoch (matplotlib skips
+    NaNs in a line plot automatically).
+
+    Args:
+        epochs:               epoch indices at which diagnostics were evaluated
+        omega_eff_by_feature: {feature_index: omega_eff values}, each same
+                               length as epochs (nan where undefined)
+        save_path:             full file path to save to (None = skip)
+        show:                  call plt.show()
+    Returns:
+        fig
+    """
+    fig, ax = plt.subplots(figsize=(8, 5))
+    for feature_index, values in omega_eff_by_feature.items():
+        ax.plot(epochs, values, marker="o", ms=4, lw=2, alpha=0.85, label=f"feature {feature_index}")
+    ax.set_xlabel("Epoch", fontsize=12)
+    ax.set_ylabel(r"$\omega_{eff}$", fontsize=12)
+    ax.set_title("Spectral second moment vs. training epoch", fontsize=13)
+    ax.set_ylim(-0.02, 1.02)
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=10)
+    fig.tight_layout()
+    _save(fig, save_path)
+    if show:
+        plt.show()
+    return fig
+
+
+def plot_eta_lambda_comparison(
+    eta_init_by_mode: Dict[int, Union[np.ndarray, "torch.Tensor"]],
+    eta_final_by_mode: Dict[int, Union[np.ndarray, "torch.Tensor"]],
+    save_path: Optional[Union[str, Path]] = None,
+    show: bool = True,
+) -> plt.Figure:
+    """
+    eta_lambda (Haar-relative harmonic weight, see
+    spectral.haar_relative_harmonic_weight) vs. lambda, at initialization vs.
+    after training, one panel per encoded mode. The horizontal line at
+    eta=1.0 is the Haar-random reference (Schur's lemma expectation); values
+    above/below it mean training concentrated/depleted amplitude in that
+    lambda-photons-in-mode-k sector relative to a generic (Haar-random) W1.
+
+    Args:
+        eta_init_by_mode, eta_final_by_mode: {mode_index: eta_lambda array},
+            each of length n_photons+1
+        save_path: full file path to save to (None = skip)
+        show:      call plt.show()
+    Returns:
+        fig
+    """
+    modes = sorted(eta_init_by_mode.keys())
+    fig, axes = plt.subplots(1, len(modes), figsize=(4.5 * len(modes), 4.5), squeeze=False)
+    axes = axes[0]
+
+    for ax, mode in zip(axes, modes):
+        eta_init = _to_numpy(eta_init_by_mode[mode])
+        eta_final = _to_numpy(eta_final_by_mode[mode])
+        lam = np.arange(len(eta_init))
+
+        ax.axhline(1.0, color="gray", linestyle="--", alpha=0.6, label="Haar reference")
+        ax.plot(lam, eta_init, marker="o", ms=5, lw=2, alpha=0.85, label="init")
+        ax.plot(lam, eta_final, marker="s", ms=5, lw=2, alpha=0.85, label="after training")
+        ax.set_xlabel(r"$\lambda$ (photons in mode)", fontsize=11)
+        ax.set_ylabel(r"$\eta_\lambda$", fontsize=11)
+        ax.set_title(f"mode {mode}", fontsize=12)
+        ax.set_xticks(lam)
+        ax.grid(True, alpha=0.3)
+        ax.legend(fontsize=9)
+
+    fig.suptitle("Haar-relative harmonic weight: init vs. after training", fontsize=13)
+    fig.tight_layout()
+    _save(fig, save_path)
+    if show:
+        plt.show()
+    return fig
+
+
+def plot_gauge_stability(
+    omega_eff_labeled_by_seed: Dict[int, Union[np.ndarray, "torch.Tensor"]],
+    omega_eff_sorted_by_seed: Dict[int, Union[np.ndarray, "torch.Tensor"]],
+    save_path: Optional[Union[str, Path]] = None,
+    show: bool = True,
+) -> plt.Figure:
+    """
+    Feature index is not a physical label — a mode permutation combined with
+    the matching W1/W2/feature_map row permutation is an exact symmetry of
+    the model (see spectral.py's gauge-invariant-summaries section, verified
+    in tests/test_spectral.py::test_mode_permutation_gauge_symmetry), so a
+    claim like "feature k has low omega_eff" only means something about one
+    specific trained instance, not the architecture. This plots both views
+    across seeds to make that concrete: left panel is the labeled vector
+    (x = feature index) — if lines cross a lot across seeds, the per-index
+    ranking is set by initialization, not architecture; right panel is the
+    same data sorted (x = rank) — if it's markedly more stable across seeds
+    than the left panel, that confirms the sorted profile is the
+    architectural signal and the labeled one isn't.
+
+    Args:
+        omega_eff_labeled_by_seed: {seed: omega_eff}, native feature order
+        omega_eff_sorted_by_seed:  {seed: omega_eff}, sorted descending
+        save_path: full file path to save to (None = skip)
+        show:      call plt.show()
+    Returns:
+        fig
+    """
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5), sharey=True)
+
+    for seed, values in omega_eff_labeled_by_seed.items():
+        v = _to_numpy(values)
+        ax1.plot(np.arange(len(v)), v, marker="o", ms=5, lw=1.5, alpha=0.75, label=f"seed {seed}")
+    ax1.set_xlabel("Feature index (labeled)", fontsize=11)
+    ax1.set_ylabel(r"$\omega_{eff}$", fontsize=11)
+    ax1.set_title("Labeled — gauge-dependent", fontsize=12)
+    ax1.set_xticks(np.arange(len(next(iter(omega_eff_labeled_by_seed.values())))))
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(fontsize=8)
+
+    for seed, values in omega_eff_sorted_by_seed.items():
+        v = _to_numpy(values)
+        ax2.plot(np.arange(len(v)), v, marker="s", ms=5, lw=1.5, alpha=0.75, label=f"seed {seed}")
+    ax2.set_xlabel("Rank (sorted descending)", fontsize=11)
+    ax2.set_title("Sorted — gauge-invariant", fontsize=12)
+    ax2.set_xticks(np.arange(len(next(iter(omega_eff_sorted_by_seed.values())))))
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(fontsize=8)
+
+    fig.suptitle("omega_eff across seeds: labeled vs. sorted", fontsize=13)
+    fig.tight_layout()
+    _save(fig, save_path)
+    if show:
+        plt.show()
+    return fig
+
+
+def plot_physical_realized_frequency(
+    freq_by_feature: Dict[int, Union[np.ndarray, "torch.Tensor"]],
+    save_path: Optional[Union[str, Path]] = None,
+    show: bool = True,
+) -> plt.Figure:
+    """
+    Local physical (k_x, k_t) frequency each feature's theta-space harmonic
+    induces at every reference point (see spectral.physical_realized_frequency),
+    scattered rather than reduced to a single number because the pushforward
+    Jacobian d(feature_map)/d(x,t) varies across the domain for this model's
+    nonlinear (Tanh) feature_map — a theta-space lattice point becomes a
+    chirp, not a fixed tone, in physical space. A tight cluster for a given
+    feature means that harmonic behaves like a near-constant physical
+    frequency there; a spread-out cloud means it doesn't, and reporting a
+    single "the frequency" number for it would be misleading.
+
+    Args:
+        freq_by_feature: {feature_index: (B, 2) array of local (k_x, k_t) pairs}
+        save_path: full file path to save to (None = skip)
+        show:      call plt.show()
+    Returns:
+        fig
+    """
+    fig, ax = plt.subplots(figsize=(7, 6))
+    for feature_index, freq in freq_by_feature.items():
+        f = _to_numpy(freq)
+        ax.scatter(f[:, 0], f[:, 1], s=18, alpha=0.6, label=f"feature {feature_index}")
+    ax.set_xlabel(r"local $k_x$", fontsize=12)
+    ax.set_ylabel(r"local $k_t$", fontsize=12)
+    ax.set_title("Physical realized frequency (pushforward through feature_map)", fontsize=12)
+    ax.axhline(0, color="gray", lw=0.8, alpha=0.5)
+    ax.axvline(0, color="gray", lw=0.8, alpha=0.5)
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=9)
     fig.tight_layout()
     _save(fig, save_path)
     if show:
