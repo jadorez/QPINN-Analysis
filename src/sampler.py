@@ -8,7 +8,7 @@ class DataSampler:
     This class handles the selection of those points
     """
 
-    def __init__(self, pde: PDE, device: torch.device, dtype: torch.dtype, n_interior: int = 64, n_initial: int = 64, n_boundary: int = 64
+    def __init__(self, pde: PDE, device: torch.device, dtype: torch.dtype, n_interior: int = 128, n_initial: int = 128, n_boundary: int = 128
                  ):
 
         self.pde = pde

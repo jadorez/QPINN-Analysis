@@ -59,7 +59,30 @@ def quantum_outputsize_for_param_match(feature_size: int, hidden_readout: int):
     return (2 * feature_size * (feature_size+1) + dimH * hidden_readout) / (feature_size + hidden_readout + 1)
     #return (feature_size * (dimH+1) + dimH * (hidden_readout+1)) / (feature_size + hidden_readout + 1)
 
+def find_matching_hidden_readout(feature_sizes : List[int], ranges : List[int]):
+    if len(ranges) != 2:
+        raise ValueError("Argument ranges must be of length 2, with format [min_range,max_range].")
+    if ranges[0]>ranges[1]:
+        raise ValueError("ranges first min value must be smaller than max value.")
+    
+    Frange = np.linspace(ranges[0],ranges[1], ranges[1])
+    Hrange = np.linspace(ranges[0],ranges[1], ranges[1])
+    outers = []
+    for i in Frange:
+        for j in range(len(Hrange)):
+            qo = quantum_outputsize_for_param_match(i,Hrange[j]) #len(Hrange)-j-1
+            if int(qo)==qo:
+                outers.append([int(i),int(Hrange[j])])
 
+    print(np.sort(outers,axis=1))
 
+    hidden_readouts = []
+    feature_sizes_return = []
+    for fs in feature_sizes:
+        for out_pair in outers:
+            if out_pair[0]==fs:
+                feature_sizes_return.append(fs)
+                hidden_readouts.append(out_pair[1])
+                break
 
-
+    return feature_sizes_return, hidden_readouts

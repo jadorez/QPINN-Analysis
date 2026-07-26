@@ -23,13 +23,13 @@ def train(
     sampler = None,
     # ---------- optimisation ----------
     epochs: int = 300,
-    lr: float = 1e-2,
+    lr: float = 0.5e-2, #1e-2,
     optimizer_name: str = "Adam",        # "adam" | "sgd"
     # ---------- loss weights ----------
     lambda_pde: float = 1.0,
-    lambda_consistency: float = 0.1,
+    lambda_consistency: float = 0.5,
     lambda_initial: float = 10.0,
-    lambda_boundary: float = 1.0,
+    lambda_boundary: float = 2.0,
     # ---------- lr scheduling ----------
     lr_decay: Optional[str] = None,      # None | "exponential" | "step" | "cosine"
     lr_decay_factor: float = 0.1,
@@ -70,6 +70,7 @@ def train(
     # ------------------------------------------------------------------ setup
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        #device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
 
     torch.manual_seed(seed)
     np.random.seed(seed)

@@ -13,10 +13,10 @@ def total_loss(
     xt_i,
     xt_b,
     pde,
-    lambda_f=1.0,
-    lambda_c=0.1,
-    lambda_i=10.0,
-    lambda_b=1.0,
+    lambda_f= 5.0, #1.0,
+    lambda_c= 2.0, #0.5,
+    lambda_i= 2.0, #10.0
+    lambda_b= 2.0, #2.0
 ):
     """
     Computes total weighted PINN/QPINN loss.
@@ -115,12 +115,19 @@ def ic_loss(model, xt_i, pde: PDE):
     Returns:
         loss: MSE loss at initial time
     """
+
+    xt_i = xt_i.requires_grad_(True)
     u, _, *_ = model(xt_i)
     x = xt_i[:, 0:1]
 
     u_ic = pde.initial_condition(x)
+    loss = mse(u, u_ic)
+    if hasattr(pde, "initial_velocity"):
+        u_t = gradient(u, xt_i)[:, 1:2]
+        ut_ic = pde.initial_velocity(x)
+        loss = loss + 1*mse(u_t, ut_ic)
 
-    return mse(u, u_ic)
+    return loss
 
 
 def bc_loss(model, xt_b, pde: PDE):
@@ -144,8 +151,8 @@ def bc_loss(model, xt_b, pde: PDE):
 
     loss = 0.0
 
-    left_mask = torch.isclose(x, torch.zeros_like(x))
-    right_mask = torch.isclose(x, torch.ones_like(x))
+    left_mask = torch.isclose(x, torch.full_like(x, pde.x_min))
+    right_mask = torch.isclose(x, torch.full_like(x, pde.x_max))
 
     if left_mask.any():
         u_left = pde.boundary_condition_left(t[left_mask])

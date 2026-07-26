@@ -42,8 +42,8 @@ class HeatEquation(PDE):
 # Defaults parameters : (can be called in init of class)
     freq: float = 0.5 # freq of IC - ! ONLY TAKES MULTIPLES OF 0.5 !
     alpha: float = 0.025 # heat diffusion parameter
-    x_min: float = 0.0 #bounds of spacetime interval
-    x_max: float = 1.0
+    x_min: float = 0 #bounds of spacetime interval
+    x_max: float = 1
     t_min: float = 0.0
     t_max: float = 1.0
 
@@ -60,12 +60,12 @@ class HeatEquation(PDE):
 
     def exact_solution(self, x, t):
         """Return exact solution u(x,t)."""
-        return torch.exp(-self.alpha *4* self.freq * self.freq * math.pi ** 2 * t) * torch.sin(
-            2 * self.freq * math.pi * x)
+        return torch.exp(-self.alpha *4* self.freq * self.freq  * t) * torch.sin( #* math.pi ** 2
+            2 * self.freq * x) #math.pi *
     def initial_condition(self, x):
         """Return IC: u(x, 0) = f(x)"""
         # return torch.sin(math.pi * x)
-        return torch.sin(2 * self.freq * math.pi * x)
+        return torch.sin(2 * self.freq * x) #* math.pi
 
     def boundary_condition_left(self, t):
         """Return BC: u(0, t) = g1(t)"""
@@ -80,6 +80,7 @@ class HeatEquation(PDE):
 class WaveEquation(PDE):
 
     c: float = 1.0  # Wave speed
+    freq: float = 1.0
 
     # TODO : on pourrait faire une liste de waves pour avoir des interférences => spectre de frquences tres large
 
@@ -96,15 +97,28 @@ class WaveEquation(PDE):
 
         residual = u_tt - (self.c ** 2) * u_xx
         return residual
-
+#    def residual(self, u, u_x, points):
+#        """
+#        Compute Wave PDE residual.
+#        d²u/dt² - c² * d²u/dx² = 0
+#        """
+#        u_x_true = gradient(u, points)[:, 0:1]
+#        u_xx = gradient(u_x_true, points)[:, 0:1]
+#
+#        u_t = gradient(u, points)[:, 1:2]
+#        u_tt = gradient(u_t, points)[:, 1:2]
+#
+#        residual = u_tt - (self.c ** 2) * u_xx
+#        return residual
+    
     def exact_solution(self, x, t):
 
-        return torch.sin(math.pi * x) * torch.cos(math.pi * self.c * t)
+        return torch.sin(math.pi * self.freq * x) * torch.cos(math.pi * self.c * self.freq * t)
 
     def initial_condition(self, x):
         """IC: u(x, 0) = sin(pi*x)"""
 
-        return torch.sin(math.pi * x)
+        return torch.sin(math.pi * self.freq * x)
 
     def boundary_condition_left(self, t):
         """BC: u(0, t) = 0"""
@@ -115,3 +129,7 @@ class WaveEquation(PDE):
         """BC: u(1, t) = 0"""
 
         return torch.zeros_like(t)
+    
+    def initial_velocity(self, x):
+        """IC: u_t(x, 0) = 0"""
+        return torch.zeros_like(x)
