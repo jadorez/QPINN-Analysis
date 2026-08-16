@@ -51,7 +51,9 @@ class HeatEquation(PDE):
     def residual(self, u, u_x, points):
         """Uses u and du/dx and sample points computes and returns residual du/dt - alpha * d²u/dx²"""
 
-        u_xx = gradient(u_x, points)[:, 0:1]
+        #u_xx = gradient(u_x, points)[:, 0:1]
+        u_x_true = gradient(u, points)[:, 0:1]
+        u_xx = gradient(u_x_true, points)[:, 0:1]
 
         u_t = gradient(u, points)[:, 1:2]
 
@@ -60,12 +62,12 @@ class HeatEquation(PDE):
 
     def exact_solution(self, x, t):
         """Return exact solution u(x,t)."""
-        return torch.exp(-self.alpha *4* self.freq * self.freq  * t) * torch.sin( #* math.pi ** 2
-            2 * self.freq * x) #math.pi *
+        return torch.exp(-self.alpha * 4 * self.freq * math.pi ** 2 * self.freq  * t) * torch.sin(
+            2 * self.freq * math.pi * x) 
     def initial_condition(self, x):
         """Return IC: u(x, 0) = f(x)"""
         # return torch.sin(math.pi * x)
-        return torch.sin(2 * self.freq * x) #* math.pi
+        return torch.sin(2 * self.freq * x * math.pi) 
 
     def boundary_condition_left(self, t):
         """Return BC: u(0, t) = g1(t)"""
@@ -90,7 +92,9 @@ class WaveEquation(PDE):
         d²u/dt² - c² * d²u/dx² = 0
         """
 
-        u_xx = gradient(u_x, points)[:, 0:1]
+        #u_xx = gradient(u_x, points)[:, 0:1]
+        u_x_true = gradient(u, points)[:, 0:1]
+        u_xx = gradient(u_x_true, points)[:, 0:1]
 
         u_t = gradient(u, points)[:, 1:2]
         u_tt = gradient(u_t, points)[:, 1:2]
@@ -113,12 +117,12 @@ class WaveEquation(PDE):
     
     def exact_solution(self, x, t):
 
-        return torch.sin(math.pi * self.freq * x) * torch.cos(math.pi * self.c * self.freq * t)
+        return torch.sin(math.pi * 2 * self.freq * x) * torch.cos(math.pi *  2 * self.c * self.freq * t)
 
     def initial_condition(self, x):
         """IC: u(x, 0) = sin(pi*x)"""
 
-        return torch.sin(math.pi * self.freq * x)
+        return torch.sin(math.pi * 2 * self.freq * x)
 
     def boundary_condition_left(self, t):
         """BC: u(0, t) = 0"""

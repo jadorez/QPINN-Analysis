@@ -4,6 +4,7 @@ train.py — standalone training loop for QPINN / classical PINNs.
 
 """
 
+import copy
 import time
 import numpy as np
 import torch
@@ -13,6 +14,7 @@ from typing import Optional
 from src.sampler import DataSampler
 from src.pde import PDE
 from src.loss import total_loss
+from src.eval import evaluate
 
 
 def train(
@@ -23,13 +25,13 @@ def train(
     sampler = None,
     # ---------- optimisation ----------
     epochs: int = 300,
-    lr: float = 0.5e-2, #1e-2,
+    lr: float = 1e-2,#0.5e-2, #1e-2,
     optimizer_name: str = "Adam",        # "adam" | "sgd"
     # ---------- loss weights ----------
-    lambda_pde: float = 1.0,
-    lambda_consistency: float = 0.5,
-    lambda_initial: float = 10.0,
-    lambda_boundary: float = 2.0,
+    lambda_pde: float = 1.0,            #1.0
+        lambda_consistency: float = 0.5,    #0.1
+        lambda_initial: float = 10.0,       #10.0
+        lambda_boundary: float = 0.0,       #1.0
     # ---------- lr scheduling ----------
     lr_decay: Optional[str] = None,      # None | "exponential" | "step" | "cosine"
     lr_decay_factor: float = 0.1,
@@ -39,6 +41,12 @@ def train(
     dtype: torch.dtype = torch.float32,
     log_every: int = 50,
     seed: int = 42,
+    # ---------- best-checkpoint tracking (opt-in; off => identical to before) ----------
+    track_best: bool = False,
+    eval_every: int = 50,
+    eval_nx: int = 60,
+    eval_nt: int = 60,
+    best_info: Optional[dict] = None,
 ) -> np.ndarray:
     """
     Train a PINN model.
@@ -61,6 +69,31 @@ def train(
         dtype:            torch dtype
         log_every:        print interval
         seed:             random seed
+        track_best:       if True, every `eval_every` epochs evaluate on a
+                          FIXED (not resampled) (eval_nx, eval_nt) grid via
+                          src.eval.evaluate, and keep the state_dict with the
+                          lowest fixed-grid rel_l2 seen. At the end of
+                          training, `model` is loaded with those best
+                          weights in place instead of the final epoch's.
+                          This is deliberately NOT based on the noisy
+                          per-epoch training loss (whose collocation points
+                          are freshly resampled every epoch, so argmin over
+                          it partly selects sampling luck, not model
+                          quality) -- see the discussion this was added for.
+                          Default False reproduces the exact prior behaviour
+                          (final-epoch weights, same return value).
+        eval_every:       epoch interval between fixed-grid checkpoint evals
+                          (only used if track_best=True). Also always checks
+                          epoch 1 and the final epoch.
+        eval_nx, eval_nt: resolution of the fixed tracking grid (only used
+                          if track_best=True); does not have to match the
+                          grid used for final reporting.
+        best_info:        optional dict; if provided and track_best=True, is
+                          populated in place with "best_epoch",
+                          "best_rel_l2", and "fixed_eval_history" (list of
+                          (epoch, rel_l2) tuples) so callers can inspect the
+                          tracking curve without changing this function's
+                          return type.
 
     Returns:
         history: np.ndarray of shape (epochs, 6)
@@ -121,6 +154,11 @@ def train(
     history = []
     start = time.time()
 
+    best_rel_l2 = float("inf")
+    best_epoch: Optional[int] = None
+    best_state = None
+    fixed_eval_history = []
+
     for epoch in range(1, epochs + 1):
         model.train()
 
@@ -164,5 +202,39 @@ def train(
                 f"Time: {elapsed:.1f}s"
             )
 
+        # ---- optional best-checkpoint tracking on a FIXED (non-resampled)
+        # eval grid, deliberately separate from the noisy per-epoch training
+        # loss above (see track_best docstring). ----
+        if track_best and (epoch == 1 or epoch % eval_every == 0 or epoch == epochs):
+            model.eval()
+            with torch.no_grad():
+                eval_metrics, *_ = evaluate(
+                    model=model, pde=pde, nx=eval_nx, nt=eval_nt,
+                    device=device, dtype=dtype, verbose=False,
+                )
+            model.train()
+            fixed_eval_history.append((epoch, eval_metrics["rel_l2"]))
+            if eval_metrics["rel_l2"] < best_rel_l2:
+                best_rel_l2 = eval_metrics["rel_l2"]
+                best_epoch = epoch
+                best_state = copy.deepcopy(model.state_dict())
+
     print(f"\nDone — {time.time() - start:.1f}s total")
+
+    if track_best and best_state is not None:
+        final_rel_l2 = fixed_eval_history[-1][1] if fixed_eval_history else None
+        print(
+            f"[track_best] restoring epoch {best_epoch}/{epochs} weights "
+            f"(fixed-grid rel_l2={best_rel_l2:.4e}) in place of the final "
+            f"epoch's weights"
+            + (f" (final-epoch fixed-grid rel_l2={final_rel_l2:.4e})"
+               if final_rel_l2 is not None else "")
+        )
+        model.load_state_dict(best_state)
+        if best_info is not None:
+            best_info["best_epoch"] = best_epoch
+            best_info["best_rel_l2"] = best_rel_l2
+            best_info["final_epoch_rel_l2"] = final_rel_l2
+            best_info["fixed_eval_history"] = fixed_eval_history
+
     return np.array(history)
