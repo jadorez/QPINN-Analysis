@@ -60,7 +60,7 @@ import torch
 from src.pde import HeatEquation, WaveEquation
 from src.models import ClassicalHeatQPINN, MerlinTunableEntropy
 from src.loss import total_loss
-from src.diagnostics import train_and_diagnose, TrainingDiagnostics
+from src.diagnostics import train_and_diagnose, check_training_sanity, TrainingDiagnostics
 from src.sweep import match_classical_params, analytic_frequency_bound
 
 
@@ -568,3 +568,142 @@ def run_L_sweep_checkpoints(
                     print(f"  [{run_idx:4d}/{total_runs}] L={L} seed={seed} {model_type:10s} "
                           f"elapsed={elapsed/60:.1f}m eta={eta/60:.1f}m")
     return paths
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# resuming — continue training an existing checkpoint for more epochs
+# ─────────────────────────────────────────────────────────────────────────
+
+def resume_checkpoint(
+    ckpt_dir: Union[str, Path],
+    source: Union[dict, str, Path],
+    additional_epochs: int,
+    quantum_cls=MerlinTunableEntropy,
+    classical_cls=ClassicalHeatQPINN,
+    loss_fn=total_loss,
+    log_every: Optional[int] = None,
+    device: Optional[torch.device] = None,
+    dtype: torch.dtype = torch.float32,
+    track_best: bool = True,
+    eval_every: int = 50,
+    eval_nx: int = 60,
+    eval_nt: int = 60,
+    overwrite: bool = False,
+    verbose: bool = True,
+) -> Path:
+    """
+    Continue training from an already-saved checkpoint for `additional_epochs`
+    more epochs, and save the result as a NEW checkpoint file -- same config
+    as `source` except `epochs = source_epochs + additional_epochs` (and a
+    `resumed_from_epochs` field recording where it picked up). The source
+    file is never modified, so both the shorter and longer runs stay around
+    to compare, and the usual skip-if-exists behaviour applies to the new
+    file too (calling this twice for the same `additional_epochs` is a
+    no-op the second time).
+
+    LIGHTWEIGHT resume, not bit-exact: only the model weights are restored
+    (from `source["state_dict"]` -- the best-checkpoint weights if that run
+    used `track_best=True`, otherwise its final-epoch weights). The
+    optimizer is reinitialised from scratch (Adam's momentum/variance
+    buffers restart at zero -- a mild, usually unnoticeable transient, not a
+    correctness issue) and training is reseeded from the run's own `seed`
+    rather than continuing its exact prior RNG state, so the collocation
+    points sampled during these extra epochs are NOT a continuation of the
+    same pseudo-random sequence a single uninterrupted
+    `epochs=source_epochs+additional_epochs` run would have produced.
+    `sampler.py` resamples fresh random points every epoch regardless of
+    where in training you are, so this doesn't change what the model can
+    learn -- it only means this function isn't bit-for-bit reproducible
+    against an unbroken run of the combined length.
+
+    `track_best`/`eval_every` apply to the CONTINUATION only: if enabled,
+    the first fixed-grid eval (epoch 1 of the continuation) closely
+    approximates "keep the starting point" as a floor, but isn't exactly it
+    -- a few gradient steps happen first, so it's possible (if unlikely) for
+    the continuation to end up slightly worse than `source` if it never
+    recovers past that point. Diagnostics on the new checkpoint are
+    recomputed over the FULL (concatenated source + continuation) loss
+    history, so trend/oscillation checks reflect the whole run, not just
+    the epochs just added.
+
+    Args:
+        source: a checkpoint dict (e.g. from `load_checkpoint`/
+                `load_checkpoints`) or a path to one on disk.
+    Returns:
+        path to the new, longer checkpoint (or the existing one, if a
+        checkpoint for the resulting epoch count is already on disk and
+        `overwrite=False`).
+    """
+    if isinstance(source, (str, Path)):
+        source = load_checkpoint(source)
+
+    cfg = dict(source["config"])
+    original_epochs = cfg["epochs"]
+    new_epochs = original_epochs + additional_epochs
+    new_config = dict(cfg, epochs=new_epochs, resumed_from_epochs=original_epochs)
+
+    ckpt_dir = Path(ckpt_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    path = ckpt_dir / checkpoint_filename(new_config)
+    if path.exists() and not overwrite:
+        if verbose:
+            print(f"[checkpoints] skip (already exists): {path.name}")
+        return path
+
+    if log_every is None:
+        log_every = additional_epochs + 1
+
+    pde = build_pde_from_config(cfg)
+    torch.manual_seed(cfg["seed"])
+    np.random.seed(cfg["seed"])
+    model = build_model(cfg["model_type"], cfg, pde, quantum_cls=quantum_cls, classical_cls=classical_cls)
+    model.load_state_dict(source["state_dict"])
+
+    metrics, _continuation_diag, extras = train_and_diagnose(
+        model=model, pde=pde, loss_fn=loss_fn, seed=cfg["seed"], epochs=additional_epochs,
+        log_every=log_every, device=device, dtype=dtype, model_type=cfg["model_type"],
+        diag_verbose=False, track_best=track_best, eval_every=eval_every,
+        nx=eval_nx, nt=eval_nt,
+    )
+    U_pred, U_true, x_grid, t_grid, continuation_history = extras
+    full_history = np.concatenate(
+        [np.asarray(source["history"]), np.asarray(continuation_history)], axis=0,
+    )
+
+    local_eval_epoch = (
+        int(_continuation_diag.values["best_epoch"])
+        if "best_epoch" in _continuation_diag.values else int(additional_epochs)
+    )
+    eval_epoch = original_epochs + local_eval_epoch
+
+    # recompute diagnostics over the WHOLE run (not just the epochs just
+    # added), so trend/oscillation checks see the full picture.
+    diag = check_training_sanity(
+        model=model, pde=pde, history=full_history, U_pred=U_pred, U_true=U_true,
+        x_grid=x_grid, t_grid=t_grid, seed=cfg["seed"], model_type=cfg["model_type"], verbose=False,
+    )
+
+    param_count = _param_count(model)
+    analytic_bound = (
+        analytic_frequency_bound(cfg["feature_size"], cfg["L"]) if cfg["model_type"] == "quantum" else None
+    )
+
+    ckpt = {
+        "config": new_config,
+        "state_dict": model.state_dict(),
+        "history": full_history,
+        "metrics": metrics,
+        "eval_epoch": eval_epoch,
+        "param_count": int(param_count),
+        "U_pred": U_pred, "U_true": U_true, "x_grid": x_grid, "t_grid": t_grid,
+        "diagnostics": _diag_to_dict(diag),
+        "analytic_bound": analytic_bound,
+    }
+    torch.save(ckpt, path)
+
+    if verbose:
+        flag = "OK" if diag.passed else "ISSUES: " + "; ".join(diag.messages[:2])
+        src_name = source.get("_path", "<in-memory checkpoint>")
+        print(f"[checkpoints] resumed {src_name} ({original_epochs} -> {new_epochs} epochs) "
+              f"-> saved {path.name}  rel_l2={metrics['rel_l2']:.3e}  {flag}")
+    return path
