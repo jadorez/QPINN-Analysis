@@ -318,6 +318,11 @@ class DepthSweepResult:
     # track_best=True, otherwise the final epoch (epochs). Lets plots mark
     # which point on the training curve corresponds to the reported metric.
     eval_epochs: Dict[str, List[List[Optional[int]]]] = None
+    # solutions[model_type][i][s] -> dict with keys "U_pred", "U_true",
+    # "x_grid", "t_grid" (the eval-grid tensors from evaluate(), evaluated
+    # on whichever checkpoint eval_epochs[...][i][s] points at). None
+    # entries mean "not collected".
+    solutions: Dict[str, List[List[Optional[dict]]]] = None
 
     def mean(self, model_type: str, metric: str) -> np.ndarray:
         return np.nanmean(self.raw[model_type][metric], axis=-1)
@@ -325,12 +330,32 @@ class DepthSweepResult:
     def std(self, model_type: str, metric: str) -> np.ndarray:
         return np.nanstd(self.raw[model_type][metric], axis=-1)
 
+    def _index(self, depth, seed) -> Tuple[int, int]:
+        i = int(np.where(self.depths == depth)[0][0])
+        s = self.seeds.index(seed)
+        return i, s
+
     def history(self, model_type: str, depth, seed) -> np.ndarray:
         """Look up one run's loss-history array by depth VALUE and seed
         VALUE (not array index) -- e.g. `result.history("quantum", 3, 42)`."""
-        i = int(np.where(self.depths == depth)[0][0])
-        s = self.seeds.index(seed)
+        i, s = self._index(depth, seed)
         return self.histories[model_type][i][s]
+
+    def solution(self, model_type: str, depth, seed) -> dict:
+        """Look up one run's {"U_pred","U_true","x_grid","t_grid"} dict by
+        depth VALUE and seed VALUE -- e.g. `result.solution("quantum", 3, 42)`.
+        Feed straight to `src.plotter.plot_depth_sweep_solution`."""
+        if self.solutions is None:
+            raise ValueError(
+                "result.solutions is empty -- this DepthSweepResult was produced "
+                "before solution-grid tracking was added to run_depth_sweep; "
+                "rerun the sweep."
+            )
+        i, s = self._index(depth, seed)
+        sol = self.solutions[model_type][i][s]
+        if sol is None:
+            raise ValueError(f"no stored solution for model_type={model_type!r}, depth={depth}, seed={seed}")
+        return sol
 
 
 def run_depth_sweep(
@@ -398,6 +423,10 @@ def run_depth_sweep(
         "classical": [[None] * n_seeds for _ in range(n_depths)],
         "quantum": [[None] * n_seeds for _ in range(n_depths)],
     }
+    solutions: Dict[str, List[List[Optional[dict]]]] = {
+        "classical": [[None] * n_seeds for _ in range(n_depths)],
+        "quantum": [[None] * n_seeds for _ in range(n_depths)],
+    }
 
     total_runs = n_depths * n_seeds * 2
     run_idx = 0
@@ -449,7 +478,13 @@ def run_depth_sweep(
                     track_best=track_best, eval_every=eval_every,
                 )
                 diagnostics_log.append(diag)
-                histories[model_type][i][s] = extras[-1]  # (U_pred,U_true,x,t,history)
+                # extras = (U_pred, U_true, x_grid, t_grid, history) -- see
+                # train_and_diagnose's return docstring.
+                U_pred, U_true, x_grid, t_grid, history = extras
+                histories[model_type][i][s] = history
+                solutions[model_type][i][s] = {
+                    "U_pred": U_pred, "U_true": U_true, "x_grid": x_grid, "t_grid": t_grid,
+                }
                 # epoch that metrics/raw actually reflect: best checkpoint
                 # if track_best, else the final epoch.
                 eval_epochs[model_type][i][s] = (
@@ -474,4 +509,5 @@ def run_depth_sweep(
         quantum_params=quantum_params, classical_params=classical_params,
         analytic_bound=analytic_bound, feature_size=feature_size,
         diagnostics=diagnostics_log, histories=histories, eval_epochs=eval_epochs,
+        solutions=solutions,
     )

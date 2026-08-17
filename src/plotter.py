@@ -12,6 +12,7 @@ Functions:
     plot_2d_sweep(result, ...)          # src.sweep.run_2d_sweep results
     plot_depth_sweep(result, ...)       # src.sweep.run_depth_sweep results
     plot_depth_sweep_training_curves(result, ...)  # per-run loss curves
+    plot_depth_sweep_solution(result, ...)         # per-run learnt vs. exact solution
 """
 
 import numpy as np
@@ -819,6 +820,71 @@ def plot_depth_sweep_training_curves(
 
     if show:
         plt.show()
+
+    return fig
+
+
+def plot_depth_sweep_solution(
+    result,  # DepthSweepResult from src.sweep.run_depth_sweep (needs .solutions)
+    model_type: str,
+    depth,
+    seed: Optional[int] = None,
+    save_path: Optional[Union[str, Path]] = None,
+    show: bool = True,
+) -> Tuple[plt.Figure, float]:
+    """
+    The learnt solution for one specific run in a depth sweep: exact |
+    prediction | pointwise error, with rel_L2 in the title -- a thin
+    wrapper around `plot_solution_comparison` that looks the grids up from
+    a `DepthSweepResult` by depth/seed/model_type instead of requiring you
+    to have kept the raw tensors around yourself.
+
+    Args:
+        result:     `DepthSweepResult` from `src.sweep.run_depth_sweep`
+                    (`.solutions` is always populated; no special sweep-time
+                    flag needed).
+        model_type: "classical" or "quantum".
+        depth:      the actual L VALUE (not an array index), e.g. `3`.
+        seed:       the actual seed VALUE (not an array index), e.g. `42`.
+                    Defaults to the first seed in `result.seeds` if omitted.
+        save_path:  full file path to save to (None = skip)
+        show:       call plt.show()
+
+    Returns:
+        fig, rel_l2  (rel_l2 computed fresh from the stored grids, so it
+        matches exactly what's drawn -- it may differ in the last couple of
+        digits from `result.raw[model_type]["rel_l2"]` if that run used
+        `track_best`, since evaluate()'s internal float ops aren't bitwise
+        reordered identically on every call, but should agree to float32
+        precision).
+    """
+    if seed is None:
+        seed = result.seeds[0]
+
+    sol = result.solution(model_type, depth, seed)
+    fig, rel_l2 = plot_solution_comparison(
+        U_pred=sol["U_pred"], U_true=sol["U_true"],
+        x_grid=sol["x_grid"], t_grid=sol["t_grid"],
+        save_path=None,  # save after adding the suptitle below
+        show=False,
+    )
+
+    eval_epoch = None
+    if getattr(result, "eval_epochs", None) is not None:
+        i, s = result._index(depth, seed)
+        eval_epoch = result.eval_epochs[model_type][i][s]
+
+    subtitle = f"{model_type}  L={depth}  seed={seed}"
+    if eval_epoch is not None:
+        subtitle += f"  (epoch {eval_epoch})"
+    fig.suptitle(subtitle, fontsize=11, y=1.04)
+    fig.tight_layout()
+    _save(fig, save_path)
+
+    if show:
+        plt.show()
+
+    return fig, rel_l2
 
     return fig
 

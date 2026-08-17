@@ -30,7 +30,7 @@ def train(
     # ---------- loss weights ----------
     lambda_pde: float = 1.0,            #1.0
         lambda_consistency: float = 0.5,    #0.1
-        lambda_initial: float = 10.0,       #10.0
+        lambda_initial: float = 5.0,    #10.0   #10.0
         lambda_boundary: float = 0.0,       #1.0
     # ---------- lr scheduling ----------
     lr_decay: Optional[str] = None,      # None | "exponential" | "step" | "cosine"
@@ -43,7 +43,7 @@ def train(
     seed: int = 42,
     # ---------- best-checkpoint tracking (opt-in; off => identical to before) ----------
     track_best: bool = False,
-    eval_every: int = 50,
+    eval_every: int = 200,
     eval_nx: int = 60,
     eval_nt: int = 60,
     best_info: Optional[dict] = None,
@@ -210,7 +210,7 @@ def train(
             with torch.no_grad():
                 eval_metrics, *_ = evaluate(
                     model=model, pde=pde, nx=eval_nx, nt=eval_nt,
-                    device=device, dtype=dtype, verbose=False,
+                    device=device, dtype=dtype,
                 )
             model.train()
             fixed_eval_history.append((epoch, eval_metrics["rel_l2"]))

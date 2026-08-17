@@ -27,6 +27,7 @@ def evaluate(
     nt: int = 60,
     device: Optional[torch.device] = None,
     dtype: torch.dtype = torch.float32,
+    verbose: bool = True,
 ) -> Tuple[Dict, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Evaluate a trained PINN on a regular (x, t) grid.
@@ -52,7 +53,8 @@ def evaluate(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print(f"Evaluating on {nx}×{nt} grid …")
+    if verbose:
+        print(f"Evaluating on {nx}×{nt} grid …")
 
     x = torch.linspace(pde.x_min, pde.x_max, nx, device=device, dtype=dtype).reshape(-1, 1)
     t = torch.linspace(pde.t_min, pde.t_max, nt, device=device, dtype=dtype).reshape(-1, 1)
@@ -82,9 +84,10 @@ def evaluate(
         "rmse": rmse,
     }
 
-    print(f"  Relative L2 : {rel_l2:.4e}")
-    print(f"  MAE         : {mae:.4e}")
-    print(f"  Max abs err : {max_abs_error:.4e}")
-    print(f"  RMSE        : {rmse:.4e}")
+    if verbose:
+        print(f"  Relative L2 : {rel_l2:.4e}")
+        print(f"  MAE         : {mae:.4e}")
+        print(f"  Max abs err : {max_abs_error:.4e}")
+        print(f"  RMSE        : {rmse:.4e}")
 
     return metrics, U_pred, U_true, x.cpu(), t.cpu()
