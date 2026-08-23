@@ -63,6 +63,26 @@ def analytic_frequency_bound(feature_size: int, n_encoding_layers: int) -> int:
     for the derivation)."""
     return n_encoding_layers * n_photons_for_feature_size(feature_size)
 
+def measurement_dim_for_feature_size(feature_size: int) -> int:
+    """Dimension of the fixed-photon-number Fock-basis measurement space
+    `MerlinTunableEntropy`'s circuit outputs into -- i.e. the width of the
+    vector its readout MLP actually consumes downstream of the quantum
+    layer. Depends only on `feature_size` (via n_modes = feature_size + 1,
+    n_photons = n_photons_for_feature_size(feature_size)), NOT on
+    `n_encoding_layers`/L -- mirroring how, in the real model, growing L
+    only adds circuit (entangling-layer) parameters and never changes this
+    width. Used to give `FourierFeaturesHeatQPINN`'s `combine` layer the
+    SAME fixed output width as quantum's own bottleneck, so the two arms'
+    architectures are identical everywhere except the middle block (fixed
+    Fourier encoding + linear combine vs. photonic circuit + measurement).
+    Keep in sync with `src.models.MerlinTunableEntropy.readout`'s own
+    `scipy.special.comb(n_modes + n_photons - 1, n_photons)` if either
+    changes.
+    """
+    import scipy.special
+    n_modes = feature_size + 1
+    n_photons = n_photons_for_feature_size(feature_size)
+    return int(scipy.special.comb(n_modes + n_photons - 1, n_photons))
 
 def get_matched_widths(
     feature_size_guess: int,

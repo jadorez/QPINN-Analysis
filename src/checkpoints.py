@@ -49,6 +49,7 @@ Typical usage (see notebooks/Checkpoint_pipeline.ipynb for the full thing):
 
 from __future__ import annotations
 
+import functools
 import math
 import time
 from pathlib import Path
@@ -58,10 +59,16 @@ import numpy as np
 import torch
 
 from src.pde import HeatEquation, WaveEquation
-from src.models import ClassicalHeatQPINN, MerlinTunableEntropy
+from src.models import (
+    ClassicalHeatQPINN, MerlinTunableEntropy, FourierFeaturesHeatQPINN,
+    ModulusFourierHeatQPINN, UnitaryFourierHeatQPINN, SymmetricUnitaryHeatQPINN,
+)
 from src.loss import total_loss
 from src.diagnostics import train_and_diagnose, check_training_sanity, TrainingDiagnostics
-from src.sweep import match_classical_params, analytic_frequency_bound
+from src.sweep import (
+    match_classical_params, analytic_frequency_bound, n_photons_for_feature_size,
+    measurement_dim_for_feature_size,
+)
 
 
 SCHEMA_VERSION = 1
@@ -96,7 +103,11 @@ def build_pde_from_config(config: Dict) -> object:
 
 
 def build_model(model_type: str, config: Dict, pde,
-                 quantum_cls=MerlinTunableEntropy, classical_cls=ClassicalHeatQPINN):
+                 quantum_cls=MerlinTunableEntropy, classical_cls=ClassicalHeatQPINN,
+                 fourier_features_cls=FourierFeaturesHeatQPINN,
+                 modulus_fourier_cls=ModulusFourierHeatQPINN,
+                 unitary_fourier_cls=UnitaryFourierHeatQPINN,
+                 symmetric_unitary_cls=SymmetricUnitaryHeatQPINN):
     if model_type == "quantum":
         return quantum_cls(
             feature_size=config["feature_size"],
@@ -119,7 +130,58 @@ def build_model(model_type: str, config: Dict, pde,
             hidden_readout=config["hidden_readout"],
             pde=pde,
         )
-    raise ValueError(f"model_type must be 'classical' or 'quantum', got {model_type!r}")
+    if model_type in ("fourier_features", "fourier_full", "fourier_modulus",
+                      "fourier_unitary", "fourier_symmetric"):
+        if config.get("quantum_output_size") is None:
+            raise ValueError(
+                f"config['quantum_output_size'] is required to rebuild a "
+                f"{model_type} checkpoint's model -- it should always be set "
+                "by run_checkpoint/resolve_matched_ff_config."
+            )
+        # n_photons_per_pass = the SAME per-mode photon-number bound the
+        # quantum arm's single mesh layer has (src.sweep.n_photons_for_
+        # feature_size), and n_encoding_layers=L mirrors the quantum arm's
+        # own re-upload depth -- feature_map outputs feature_size*L values,
+        # split into L independent chunks, each given the fixed per-pass
+        # encoding (see FourierFeaturesHeatQPINN's docstring for why this
+        # re-upload structure -- not just a bigger harmonic count on one
+        # fixed feature vector -- is what makes L comparable to the
+        # quantum arm's L).
+        n_photons_per_pass = n_photons_for_feature_size(config["feature_size"])
+        common = dict(
+            feature_size=config["feature_size"],
+            hidden_feature=config["hidden_feature"],
+            quantum_output_size=config["quantum_output_size"],
+            hidden_readout=config["hidden_readout"],
+            n_photons_per_pass=n_photons_per_pass,
+            n_encoding_layers=config["L"],
+            pde=pde,
+        )
+        if model_type == "fourier_modulus":
+            # Free-amplitude control: sparse Fock comb + modulus squared,
+            # which reproduces all of Omega. Strictly CONTAINS the quantum
+            # model's function class at L=1 (see modulus_model_from_quantum).
+            return modulus_fourier_cls(**common)
+        if model_type == "fourier_unitary":
+            # Givens/unitary control: same as above but with the amplitude
+            # matrix constrained to M = B diag(A), B orthogonal. Tests
+            # whether unitarity is the operative inductive bias.
+            return unitary_fourier_cls(**common)
+        if model_type == "fourier_symmetric":
+            # Classical reimplementation of the photonic layer via the
+            # symmetric power of two m x m mode unitaries. Matches the
+            # quantum arm by construction (unit test / ablation platform,
+            # not an independent control) -- see the model's docstring.
+            return symmetric_unitary_cls(**common)
+        # "fourier_features" keeps the original axis-aligned frequency set
+        # (retained only for comparison -- see FIX #3 in the model docstring);
+        # "fourier_full" uses the real difference set Omega.
+        frequency_mode = "axis" if model_type == "fourier_features" else "full"
+        return fourier_features_cls(frequency_mode=frequency_mode, **common)
+    raise ValueError(
+        f"model_type must be one of 'classical', 'quantum', 'fourier_features', "
+        f"'fourier_full', 'fourier_modulus', got {model_type!r}"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -187,6 +249,146 @@ def resolve_matched_config(
     return result
 
 
+def resolve_matched_ff_config(
+    L: int,
+    feature_size: int,
+    hidden_feature: int,
+    hidden_readout_quantum: int,
+    pde,
+    quantum_cls=MerlinTunableEntropy,
+    fourier_features_cls=FourierFeaturesHeatQPINN,
+    modulus_fourier_cls=ModulusFourierHeatQPINN,
+    unitary_fourier_cls=UnitaryFourierHeatQPINN,
+    symmetric_unitary_cls=SymmetricUnitaryHeatQPINN,
+    model_type: str = "fourier_full",
+    match_cache: Optional[dict] = None,
+    verbose: bool = True,
+) -> Dict:
+    """
+    Architecture-matched (NOT brute-force parameter-matched) config for the
+    `fourier_features_cls` spectral-coverage control (see
+    `FourierFeaturesHeatQPINN`'s docstring) against the quantum arm at this
+    `L`.
+
+    HISTORY: an earlier version of this function called
+    `match_classical_params` to brute-force search (`ff_quantum_output_size`,
+    `ff_hidden_readout`) for an EXACT total-param match against the quantum
+    arm. That search reliably found a match, but only by collapsing
+    `combine`'s output width as `L` grew (observed in practice: 4 -> 4 -> 3
+    -> 2 across L=1..4, with `hidden_readout` exploding 13 -> 12 -> 25 -> 52
+    to compensate) -- `combine`'s input width grows by a fixed amount every
+    `L` step (`2 * n_photons_per_pass * feature_size`), eating its weight
+    budget far faster than quantum's own total params grow with `L`, and
+    shrinking `qos` was the ONLY way the search could still hit an exact
+    target at high `L`. That made "matched parameter count" true but
+    architecturally misleading: everything except `combine` was being
+    silently re-shaped by the search, not held fixed, so the FF arm was
+    never truly comparable to quantum across `L`.
+
+    Fixed by matching ARCHITECTURE instead of total params, mirroring
+    quantum's own structure exactly everywhere except the middle block:
+      - `feature_map`: same `hidden_feature`, same output width
+        (`feature_size * L`) as quantum's own feature map -- unchanged,
+        already identical between the two arms.
+      - `hidden_readout` is set to `hidden_readout_quantum` directly -- the
+        SAME constant passed to the quantum arm, not searched.
+      - Only the middle block itself (fixed Fourier encoding + linear
+        `combine`, in place of the photonic circuit + measurement) is
+        genuinely different between the two arms, and only ITS input width
+        (`encoding_dim`) still grows with `L`, giving `combine`'s own
+        parameter count natural L-dependent growth without any search.
+    Total parameter counts are consequently NOT forced to match exactly --
+    `ff_params` and `quantum_params` may differ by a nontrivial amount,
+    reported transparently via `diff`. That's an accepted, honest trade-off
+    for genuine architectural comparability, per explicit direction: exact
+    total-param matching and a non-degenerate, unsearched middle block are
+    structurally incompatible at these `L`, and architectural comparability
+    is what's required for the two arms' results to mean anything side by
+    side.
+
+    NOTE on `ff_quantum_output_size` (still computed here as
+    `src.sweep.measurement_dim_for_feature_size(feature_size)`, the SAME
+    fixed, L-independent width quantum's own circuit measures into): this
+    field is now INFORMATIONAL ONLY. `FourierFeaturesHeatQPINN` fix #2
+    (see its docstring) collapsed `combine` and what used to be `readout`'s
+    own first linear layer into a single `Linear(encoding_dim,
+    hidden_readout)`, because two consecutive un-activated linear layers
+    are always mathematically equivalent to one, just harder to optimize
+    -- so `quantum_output_size` is accepted by the model for interface
+    compatibility but no longer sizes any real layer. It's kept in the
+    returned dict (and threaded through the checkpoint filename/config
+    schema, same as the classical arm) purely so nothing downstream needs
+    to change, not because it still means anything architecturally.
+
+    Returns a dict with keys: quantum_hidden_readout, quantum_params,
+    ff_quantum_output_size, ff_hidden_readout, ff_params, n_freqs,
+    analytic_bound. (Field names deliberately mirror `resolve_matched_config`'s
+    "classical_*" keys as "ff_*" so the two are easy to use side by side.)
+    """
+    key = (int(L), int(feature_size), int(hidden_feature), int(hidden_readout_quantum),
+           quantum_cls.__name__, fourier_features_cls.__name__, str(model_type), "ff")
+    if match_cache is not None and key in match_cache:
+        return match_cache[key]
+
+    probe = quantum_cls(
+        feature_size=feature_size, hidden_feature=hidden_feature,
+        hidden_readout=hidden_readout_quantum, n_encoding_layers=L, pde=pde,
+    )
+    target_params = _param_count(probe)
+    n_photons_per_pass = n_photons_for_feature_size(feature_size)
+
+    # No search: combine's output width and the readout width are BOTH
+    # held fixed, mirroring quantum's own fixed (L-independent) bottleneck
+    # and its own fixed hidden_readout_quantum constant. Only combine's
+    # INPUT width (encoding_dim, inside fourier_features_cls itself) still
+    # grows with L, exactly like quantum's circuit growing with L -- that's
+    # the one thing this control is meant to test, not an artifact of a
+    # parameter-count search.
+    qos = measurement_dim_for_feature_size(feature_size)
+    hr_ff = int(hidden_readout_quantum)
+    common = dict(
+        feature_size=feature_size, hidden_feature=hidden_feature,
+        quantum_output_size=qos, hidden_readout=hr_ff,
+        n_photons_per_pass=n_photons_per_pass, n_encoding_layers=L, pde=pde,
+    )
+    # Build whichever arm this config is for, so `ff_params` reflects the
+    # model that will actually be trained (the three arms differ a lot here:
+    # ~1.9k params for the full-Omega linear encoding versus ~300-400 for the
+    # modulus-squared one -- see each model's docstring).
+    if model_type == "fourier_modulus":
+        ff_model = modulus_fourier_cls(**common)
+    elif model_type == "fourier_unitary":
+        ff_model = unitary_fourier_cls(**common)
+    elif model_type == "fourier_symmetric":
+        ff_model = symmetric_unitary_cls(**common)
+    else:
+        ff_model = fourier_features_cls(
+            frequency_mode="axis" if model_type == "fourier_features" else "full",
+            **common,
+        )
+    achieved = _param_count(ff_model)
+
+    n_freqs = L * n_photons_per_pass  # informational only: nominal max single-pass-equivalent bound
+    diff = achieved - target_params
+    result = {
+        "quantum_hidden_readout": int(hidden_readout_quantum),
+        "quantum_params": int(target_params),
+        "ff_quantum_output_size": int(qos),
+        "ff_hidden_readout": int(hr_ff),
+        "ff_params": int(achieved),
+        "n_freqs": int(n_freqs),
+        "analytic_bound": int(analytic_frequency_bound(feature_size, L)),
+    }
+    if verbose:
+        print(f"[checkpoints] L={L}: quantum_params={target_params}  "
+              f"bound=±{result['analytic_bound']} (n_freqs={n_freqs})  ff (architecture-matched) -> "
+              f"quantum_output_size={qos} hidden_readout={hr_ff} params={achieved} "
+              f"(diff={diff:+d})")
+    if match_cache is not None:
+        match_cache[key] = result
+    return result
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # checkpoint filename / (de)serialisation
 # ─────────────────────────────────────────────────────────────────────────
@@ -231,18 +433,22 @@ def _diag_to_dict(diag: TrainingDiagnostics) -> Dict:
 def run_checkpoint(
     ckpt_dir: Union[str, Path],
     pde,
-    model_type: str,                 # "classical" | "quantum"
+    model_type: str,                 # "classical" | "quantum" | "fourier_features"
     L: int,
     feature_size: int,
     hidden_feature: int,
     hidden_readout: int,             # ACTUAL hidden_readout for this model_type
-    quantum_output_size: Optional[int] = None,   # required if model_type == "classical"
+    quantum_output_size: Optional[int] = None,   # required if model_type in ("classical", "fourier_features")
     seed: int = 42,
     epochs: int = 1000,
     quantum_cls=MerlinTunableEntropy,
     classical_cls=ClassicalHeatQPINN,
+    fourier_features_cls=FourierFeaturesHeatQPINN,
+    modulus_fourier_cls=ModulusFourierHeatQPINN,
+    unitary_fourier_cls=UnitaryFourierHeatQPINN,
+    symmetric_unitary_cls=SymmetricUnitaryHeatQPINN,
     loss_fn=total_loss,
-    log_every: Optional[int] = None,
+    log_every: Optional[int] = 50,
     device: Optional[torch.device] = None,
     dtype: torch.dtype = torch.float32,
     track_best: bool = True,
@@ -266,12 +472,20 @@ def run_checkpoint(
 
     Returns the checkpoint's path (whether freshly trained or pre-existing).
     """
-    if model_type not in ("classical", "quantum"):
-        raise ValueError(f"model_type must be 'classical' or 'quantum', got {model_type!r}")
-    if model_type == "classical" and quantum_output_size is None:
+    if model_type not in ("classical", "quantum", "fourier_features",
+                          "fourier_full", "fourier_modulus", "fourier_unitary",
+                          "fourier_symmetric"):
         raise ValueError(
-            "quantum_output_size is required for model_type='classical' -- pass the "
-            "matched value from resolve_matched_config()['classical_quantum_output_size']."
+            f"model_type must be one of 'classical', 'quantum', 'fourier_features', "
+            f"'fourier_full', 'fourier_modulus', 'fourier_unitary', "
+            f"'fourier_symmetric', got {model_type!r}"
+        )
+    if model_type != "quantum" and quantum_output_size is None:
+        raise ValueError(
+            f"quantum_output_size is required for model_type={model_type!r} -- pass the "
+            "matched value from resolve_matched_config()['classical_quantum_output_size'] "
+            "(classical) or resolve_matched_ff_config()['ff_quantum_output_size'] "
+            "(the fourier_* arms)."
         )
 
     pde_type, pde_params = pde_to_config(pde)
@@ -303,7 +517,11 @@ def run_checkpoint(
     # global RNG at construction time, before train()'s internal reseed.
     torch.manual_seed(seed)
     np.random.seed(seed)
-    model = build_model(model_type, config, pde, quantum_cls=quantum_cls, classical_cls=classical_cls)
+    model = build_model(model_type, config, pde, quantum_cls=quantum_cls, classical_cls=classical_cls,
+                         fourier_features_cls=fourier_features_cls,
+                         modulus_fourier_cls=modulus_fourier_cls,
+                         unitary_fourier_cls=unitary_fourier_cls,
+                         symmetric_unitary_cls=symmetric_unitary_cls)
 
     metrics, diag, extras = train_and_diagnose(
         model=model, pde=pde, loss_fn=loss_fn, seed=seed, epochs=epochs,
@@ -315,7 +533,17 @@ def run_checkpoint(
 
     eval_epoch = int(diag.values["best_epoch"]) if "best_epoch" in diag.values else int(epochs)
     param_count = _param_count(model)
-    analytic_bound = analytic_frequency_bound(feature_size, L) if model_type == "quantum" else None
+    # "fourier_features" is deliberately given the SAME bound formula as
+    # "quantum" -- n_freqs is set (in build_model) to exactly L*n_photons,
+    # i.e. the same analytic ceiling, by construction (see
+    # FourierFeaturesHeatQPINN's docstring). That's what makes the two
+    # arms' bounds directly overlay-able on the same plot.
+    analytic_bound = (
+        analytic_frequency_bound(feature_size, L)
+        if model_type in ("quantum", "fourier_features", "fourier_full",
+                          "fourier_modulus", "fourier_unitary")
+        else None
+    )
 
     ckpt = {
         "config": config,
@@ -435,6 +663,7 @@ def run_param_sweep_checkpoints(
     hidden_readout_quantum: int,
     seeds: Sequence[int] = (42, 666, 69),
     epochs: int = 1000,
+    model_types: Sequence[str] = ("classical", "quantum"),
     quantum_cls=MerlinTunableEntropy,
     classical_cls=ClassicalHeatQPINN,
     loss_fn=total_loss,
@@ -467,7 +696,8 @@ def run_param_sweep_checkpoints(
         match_cache=match_cache, verbose=verbose,
     )
 
-    total_runs = len(param1_values) * len(param2_values) * len(seeds) * 2
+    model_types = tuple(model_types)
+    total_runs = len(param1_values) * len(param2_values) * len(seeds) * len(model_types)
     run_idx = 0
     t_start = time.time()
     paths = []
@@ -476,7 +706,7 @@ def run_param_sweep_checkpoints(
         for p2 in param2_values:
             pde = build_pde(pde_type, {param1_name: p1, param2_name: p2})
             for seed in seeds:
-                for model_type in ("classical", "quantum"):
+                for model_type in model_types:
                     if model_type == "quantum":
                         kwargs = dict(hidden_readout=hidden_readout_quantum, quantum_output_size=None)
                     else:
@@ -513,6 +743,7 @@ def run_L_sweep_checkpoints(
     hidden_readout_quantum: int,
     seeds: Sequence[int] = (42, 666, 69),
     epochs: int = 1000,
+    model_types: Sequence[str] = ("classical", "quantum"),
     quantum_cls=MerlinTunableEntropy,
     classical_cls=ClassicalHeatQPINN,
     loss_fn=total_loss,
@@ -535,7 +766,8 @@ def run_L_sweep_checkpoints(
     Returns the list of checkpoint paths touched (trained or skipped).
     """
     depths = list(depths)
-    total_runs = len(depths) * len(seeds) * 2
+    model_types = tuple(model_types)
+    total_runs = len(depths) * len(seeds) * len(model_types)
     run_idx = 0
     t_start = time.time()
     paths = []
@@ -547,7 +779,7 @@ def run_L_sweep_checkpoints(
             match_cache=match_cache, verbose=verbose,
         )
         for seed in seeds:
-            for model_type in ("classical", "quantum"):
+            for model_type in model_types:
                 if model_type == "quantum":
                     kwargs = dict(hidden_readout=hidden_readout_quantum, quantum_output_size=None)
                 else:
@@ -571,6 +803,181 @@ def run_L_sweep_checkpoints(
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# fourier-features control arm -- spectral-coverage-hypothesis ablation
+#
+# Adds a THIRD arm, "fourier_features" (see FourierFeaturesHeatQPINN), to
+# the SAME checkpoint directories experiments 1 and 2 already write to.
+# Deliberately does not retrain "classical"/"quantum" -- run
+# run_param_sweep_checkpoints / run_L_sweep_checkpoints first (or already
+# have those checkpoints on disk); these two functions only add the
+# control arm alongside them, with the usual skip-if-exists behaviour.
+# ─────────────────────────────────────────────────────────────────────────
+
+def run_param_sweep_ff_checkpoints(
+    ckpt_dir: Union[str, Path],
+    pde_type: str,
+    param1_name: str,
+    param1_values: Sequence[float],
+    param2_name: str,
+    param2_values: Sequence[float],
+    L: int,
+    feature_size: int,
+    hidden_feature: int,
+    hidden_readout_quantum: int,
+    seeds: Sequence[int] = (42, 666, 69),
+    epochs: int = 1000,
+    model_type: str = "fourier_full",
+    quantum_cls=MerlinTunableEntropy,
+    fourier_features_cls=FourierFeaturesHeatQPINN,
+    modulus_fourier_cls=ModulusFourierHeatQPINN,
+    unitary_fourier_cls=UnitaryFourierHeatQPINN,
+    symmetric_unitary_cls=SymmetricUnitaryHeatQPINN,
+    loss_fn=total_loss,
+    device: Optional[torch.device] = None,
+    dtype: torch.dtype = torch.float32,
+    track_best: bool = True,
+    eval_every: int = 50,
+    eval_nx: int = 60,
+    eval_nt: int = 60,
+    overwrite: bool = False,
+    verbose: bool = True,
+    match_cache: Optional[dict] = None,
+) -> List[Path]:
+    """
+    Fourier-features control for Experiment 1 (the (f,alpha)/(f,c) sweep at
+    fixed L): trains only the "fourier_features" arm, over the SAME grid,
+    into the SAME `ckpt_dir` experiment 1 already used -- so
+    `load_checkpoints(ckpt_dir, ...)` afterward returns all three arms
+    together. Config (fixed per-pass frequency reach, combine/readout width
+    ARCHITECTURE-matched -- not brute-force parameter-matched -- to the
+    quantum arm, see `resolve_matched_ff_config`'s docstring) is resolved
+    ONCE up front, same pattern as `run_param_sweep_checkpoints`.
+
+    Returns the list of checkpoint paths touched (trained or skipped).
+    """
+    param1_values = list(param1_values)
+    param2_values = list(param2_values)
+    probe_pde = build_pde(pde_type, {param1_name: param1_values[0], param2_name: param2_values[0]})
+    matched = resolve_matched_ff_config(
+        L, feature_size, hidden_feature, hidden_readout_quantum, probe_pde,
+        quantum_cls=quantum_cls, fourier_features_cls=fourier_features_cls,
+        modulus_fourier_cls=modulus_fourier_cls,
+        unitary_fourier_cls=unitary_fourier_cls,
+        symmetric_unitary_cls=symmetric_unitary_cls, model_type=model_type,
+        match_cache=match_cache, verbose=verbose,
+    )
+
+    total_runs = len(param1_values) * len(param2_values) * len(seeds)
+    run_idx = 0
+    t_start = time.time()
+    paths = []
+
+    for p1 in param1_values:
+        for p2 in param2_values:
+            pde = build_pde(pde_type, {param1_name: p1, param2_name: p2})
+            for seed in seeds:
+                path = run_checkpoint(
+                    ckpt_dir, pde, model_type, L, feature_size, hidden_feature,
+                    hidden_readout=matched["ff_hidden_readout"],
+                    quantum_output_size=matched["ff_quantum_output_size"],
+                    seed=seed, epochs=epochs, quantum_cls=quantum_cls,
+                    fourier_features_cls=fourier_features_cls,
+                    modulus_fourier_cls=modulus_fourier_cls,
+                    unitary_fourier_cls=unitary_fourier_cls,
+                    symmetric_unitary_cls=symmetric_unitary_cls,
+                    loss_fn=loss_fn, device=device, dtype=dtype, track_best=track_best,
+                    eval_every=eval_every, eval_nx=eval_nx, eval_nt=eval_nt,
+                    overwrite=overwrite, verbose=verbose,
+                )
+                paths.append(path)
+                run_idx += 1
+                if verbose:
+                    elapsed = time.time() - t_start
+                    eta = elapsed / run_idx * (total_runs - run_idx)
+                    print(f"  [{run_idx:4d}/{total_runs}] {param1_name}={p1:g} "
+                          f"{param2_name}={p2:g} seed={seed} fourier_features "
+                          f"elapsed={elapsed/60:.1f}m eta={eta/60:.1f}m")
+    return paths
+
+
+def run_L_sweep_ff_checkpoints(
+    ckpt_dir: Union[str, Path],
+    pde,
+    depths: Sequence[int],
+    feature_size: int,
+    hidden_feature: int,
+    hidden_readout_quantum: int,
+    seeds: Sequence[int] = (42, 666, 69),
+    epochs: int = 1000,
+    model_type: str = "fourier_full",
+    quantum_cls=MerlinTunableEntropy,
+    fourier_features_cls=FourierFeaturesHeatQPINN,
+    modulus_fourier_cls=ModulusFourierHeatQPINN,
+    unitary_fourier_cls=UnitaryFourierHeatQPINN,
+    symmetric_unitary_cls=SymmetricUnitaryHeatQPINN,
+    loss_fn=total_loss,
+    device: Optional[torch.device] = None,
+    dtype: torch.dtype = torch.float32,
+    track_best: bool = True,
+    eval_every: int = 50,
+    eval_nx: int = 60,
+    eval_nt: int = 60,
+    overwrite: bool = False,
+    verbose: bool = True,
+    match_cache: Optional[dict] = None,
+) -> List[Path]:
+    """
+    Fourier-features control for Experiment 2 (the L sweep at fixed PDE
+    params): trains only the "fourier_features" arm, at every L in
+    `depths`, into the SAME `ckpt_dir` experiment 2 already used. At each
+    L, n_freqs = L*n_photons -- exactly the quantum arm's own analytic
+    ceiling at that L -- so this directly tests whether the WIDENING
+    behaviour of `plot_L_sweep` also shows up in a purely classical model
+    given the same growing frequency reach, with no quantum circuit at all.
+    Matching is computed once per L, same pattern as `run_L_sweep_checkpoints`.
+
+    Returns the list of checkpoint paths touched (trained or skipped).
+    """
+    depths = list(depths)
+    total_runs = len(depths) * len(seeds)
+    run_idx = 0
+    t_start = time.time()
+    paths = []
+
+    for L in depths:
+        matched = resolve_matched_ff_config(
+            L, feature_size, hidden_feature, hidden_readout_quantum, pde,
+            quantum_cls=quantum_cls, fourier_features_cls=fourier_features_cls,
+            modulus_fourier_cls=modulus_fourier_cls,
+        unitary_fourier_cls=unitary_fourier_cls,
+        symmetric_unitary_cls=symmetric_unitary_cls, model_type=model_type,
+            match_cache=match_cache, verbose=verbose,
+        )
+        for seed in seeds:
+            path = run_checkpoint(
+                ckpt_dir, pde, model_type, L, feature_size, hidden_feature,
+                hidden_readout=matched["ff_hidden_readout"],
+                quantum_output_size=matched["ff_quantum_output_size"],
+                seed=seed, epochs=epochs, quantum_cls=quantum_cls,
+                fourier_features_cls=fourier_features_cls,
+                modulus_fourier_cls=modulus_fourier_cls,
+                unitary_fourier_cls=unitary_fourier_cls,
+                symmetric_unitary_cls=symmetric_unitary_cls,
+                loss_fn=loss_fn, device=device, dtype=dtype, track_best=track_best,
+                eval_every=eval_every, eval_nx=eval_nx, eval_nt=eval_nt,
+                overwrite=overwrite, verbose=verbose,
+            )
+            paths.append(path)
+            run_idx += 1
+            if verbose:
+                elapsed = time.time() - t_start
+                eta = elapsed / run_idx * (total_runs - run_idx)
+                print(f"  [{run_idx:4d}/{total_runs}] L={L} seed={seed} fourier_features "
+                      f"elapsed={elapsed/60:.1f}m eta={eta/60:.1f}m")
+    return paths
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # resuming — continue training an existing checkpoint for more epochs
 # ─────────────────────────────────────────────────────────────────────────
 
@@ -580,8 +987,12 @@ def resume_checkpoint(
     additional_epochs: int,
     quantum_cls=MerlinTunableEntropy,
     classical_cls=ClassicalHeatQPINN,
+    fourier_features_cls=FourierFeaturesHeatQPINN,
+    modulus_fourier_cls=ModulusFourierHeatQPINN,
+    unitary_fourier_cls=UnitaryFourierHeatQPINN,
+    symmetric_unitary_cls=SymmetricUnitaryHeatQPINN,
     loss_fn=total_loss,
-    log_every: Optional[int] = None,
+    log_every: Optional[int] = 50,
     device: Optional[torch.device] = None,
     dtype: torch.dtype = torch.float32,
     track_best: bool = True,
@@ -656,7 +1067,11 @@ def resume_checkpoint(
     pde = build_pde_from_config(cfg)
     torch.manual_seed(cfg["seed"])
     np.random.seed(cfg["seed"])
-    model = build_model(cfg["model_type"], cfg, pde, quantum_cls=quantum_cls, classical_cls=classical_cls)
+    model = build_model(cfg["model_type"], cfg, pde, quantum_cls=quantum_cls, classical_cls=classical_cls,
+                         fourier_features_cls=fourier_features_cls,
+                         modulus_fourier_cls=modulus_fourier_cls,
+                         unitary_fourier_cls=unitary_fourier_cls,
+                         symmetric_unitary_cls=symmetric_unitary_cls)
     model.load_state_dict(source["state_dict"])
 
     metrics, _continuation_diag, extras = train_and_diagnose(
@@ -685,7 +1100,8 @@ def resume_checkpoint(
 
     param_count = _param_count(model)
     analytic_bound = (
-        analytic_frequency_bound(cfg["feature_size"], cfg["L"]) if cfg["model_type"] == "quantum" else None
+        analytic_frequency_bound(cfg["feature_size"], cfg["L"])
+        if cfg["model_type"] in ("quantum", "fourier_features") else None
     )
 
     ckpt = {
@@ -707,3 +1123,109 @@ def resume_checkpoint(
         print(f"[checkpoints] resumed {src_name} ({original_epochs} -> {new_epochs} epochs) "
               f"-> saved {path.name}  rel_l2={metrics['rel_l2']:.3e}  {flag}")
     return path
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# transplant diagnostic: is the quantum arm's advantage representational
+# or optimisational?
+# ─────────────────────────────────────────────────────────────────────────
+
+def transplant_diagnostic(
+    source: Union[dict, str, Path],
+    device: Optional[torch.device] = None,
+    dtype: torch.dtype = torch.float32,
+    eval_nx: int = 60,
+    eval_nt: int = 60,
+    verbose: bool = True,
+) -> Dict:
+    """
+    Take a TRAINED quantum checkpoint at L=1, transplant its learned solution
+    into a `ModulusFourierHeatQPINN` (see `src.models.modulus_model_from_quantum`
+    for the exact correspondence and why it is exact), and evaluate both on
+    the same grid.
+
+    This is the decisive test of WHY the quantum arm wins. At L=1 with
+    n_channels=D the modulus model strictly CONTAINS the quantum model's
+    function class, so:
+
+      - rel_l2 matches  => the learned function is reachable by the free-M
+        classical model, just not FOUND by Adam from random init. The
+        advantage is TRAINABILITY (the unitary parameterisation acting as a
+        preconditioner), not spectral support and not capacity. This is the
+        outcome that reframes the paper's mechanism claim.
+      - rel_l2 does NOT match => the correspondence is broken somewhere;
+        debug before concluding anything. Check `reconstruction_error` and
+        `u_discrepancy` first -- both should be <= ~1e-4.
+
+    Usage:
+
+        ckpt = load_checkpoints(L_SWEEP_DIR, model_type="quantum", L=1,
+                                freq=FIXED_FREQ, alpha=FIXED_ALPHA_OR_C)[0]
+        info = transplant_diagnostic(ckpt)
+
+    Returns a dict with: quantum_rel_l2, transplant_rel_l2, u_discrepancy,
+    reconstruction_error, quantum_params, transplant_params, plus the two
+    models under "quantum_model"/"transplant_model" for further inspection.
+    """
+    from src.models import modulus_model_from_quantum, verify_transplant
+    from src.eval import evaluate
+
+    if not isinstance(source, dict):
+        source = load_checkpoint(source)
+    cfg = source["config"]
+    if cfg["model_type"] != "quantum":
+        raise ValueError(
+            f"transplant_diagnostic needs a 'quantum' checkpoint, got "
+            f"{cfg['model_type']!r}."
+        )
+    if cfg["L"] != 1:
+        raise ValueError(
+            f"transplant is only exact at L=1 (got L={cfg['L']}) -- see "
+            "modulus_model_from_quantum's docstring."
+        )
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    pde = build_pde_from_config(cfg)
+    quantum_model = build_model("quantum", cfg, pde)
+    quantum_model.load_state_dict(source["state_dict"])
+    quantum_model = quantum_model.to(device=device, dtype=dtype).eval()
+
+    transplant, tinfo = modulus_model_from_quantum(
+        quantum_model, pde=pde, dtype=dtype, verbose=verbose
+    )
+    transplant = transplant.eval()
+    u_discrepancy = verify_transplant(quantum_model, transplant, dtype=dtype, verbose=verbose)
+
+    with torch.no_grad():
+        mq, *_ = evaluate(model=quantum_model, pde=pde, nx=eval_nx, nt=eval_nt,
+                          device=device, dtype=dtype, verbose=False)
+        mt, *_ = evaluate(model=transplant, pde=pde, nx=eval_nx, nt=eval_nt,
+                          device=device, dtype=dtype, verbose=False)
+
+    out = {
+        "quantum_rel_l2": float(mq["rel_l2"]),
+        "transplant_rel_l2": float(mt["rel_l2"]),
+        "u_discrepancy": u_discrepancy,
+        "reconstruction_error": tinfo["reconstruction_error"],
+        "quantum_params": _param_count(quantum_model),
+        "transplant_params": _param_count(transplant),
+        "quantum_model": quantum_model,
+        "transplant_model": transplant,
+    }
+    if verbose:
+        agree = abs(out["quantum_rel_l2"] - out["transplant_rel_l2"]) <= 1e-3
+        print(f"[transplant] quantum rel_l2   = {out['quantum_rel_l2']:.6e} "
+              f"({out['quantum_params']} params)")
+        print(f"[transplant] transplant rel_l2 = {out['transplant_rel_l2']:.6e} "
+              f"({out['transplant_params']} params)")
+        if agree and u_discrepancy < 1e-4:
+            print("[transplant] => MATCH. The trained solution lies inside the "
+                  "free-M classical model's function class, so its failure when "
+                  "trained from random init is an OPTIMISATION effect, not a "
+                  "capacity or spectral-support one.")
+        else:
+            print("[transplant] => MISMATCH. Do not draw conclusions yet -- "
+                  "check reconstruction_error and u_discrepancy above.")
+    return out
