@@ -33,10 +33,10 @@ QPINN_Analysis/
 └── README.md      : you are reading this!
 ```
 
-Workflow :  
+Workflow for contributions:  
 
 Each test you perform is its own notebook and generates figures within its own subfolder in figures/  
-0) Create your notebook and explain what it does in the title
+0. Create your notebook and explain what it does in the title
 
 1) Initalize a model (from model.py) and a PDE (from pde.py)
 2) Train the model on the pde using train (from train.py), loss history is outputted
@@ -46,4 +46,3 @@ Each test you perform is its own notebook and generates figures within its own s
 
 All of these methods take default kwarguments, if you want to change/iterate over arguments input them manually in the notebook
 If you want to use another model/loss/pde/sampler/... you can add your own class and call it
-#TODO : currently  loss cant deal with PDEs that have u_tt in the residual
